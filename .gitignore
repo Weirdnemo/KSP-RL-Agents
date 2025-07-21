@@ -2,3 +2,9 @@ ksp_episodes.csv
 ppo_ksp_maxalt.zip
 __pycache__/ksp_env.cpython-310.pyc
 Hover/__pycache__/ksp_hover_env.cpython-310.pyc
+Hover/plotting.py
+Hover/ppo_hover_agent_final.zip
+Hover/ppo_hover_agent_latest.zip
+Hover/rocket_data.csv
+Hover/testing_random.py
+Hover/hover_test.py
