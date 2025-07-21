@@ -1,6 +1,6 @@
 import time
 import numpy as np
-import gym
+import gymnasium as gym
 import krpc
 
 
