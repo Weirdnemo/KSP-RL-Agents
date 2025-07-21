@@ -1,6 +1,6 @@
 import time
 import numpy as np
-import gym
+import gymnasium as gym
 import krpc
 
 
@@ -14,11 +14,12 @@ class KSPEnv(gym.Env):
 
     metadata = {"render.modes": ["human"]}
 
-    def __init__(self, auto_launch=True, step_sleep=0.2, max_steps=1500):
+    def __init__(self, auto_launch=True, step_sleep=0.2, max_steps=1500, max_episode_time=35.0):
         super().__init__()
         self.auto_launch = auto_launch
         self.step_sleep = step_sleep
         self.max_steps = max_steps
+        self.max_episode_time = max_episode_time  # Time limit in seconds
 
         # Connect to KRPC
         self.conn = krpc.connect(name="KSP RL Env")
@@ -46,6 +47,7 @@ class KSPEnv(gym.Env):
         self.prev_altitude = 0.0
         self.steps = 0
         self.done = False
+        self.episode_start_time = None
 
         # Streams
         self.altitude_s = None
@@ -69,6 +71,7 @@ class KSPEnv(gym.Env):
         self.max_altitude = 0.0
         self.episode_max_alt = 0.0
         self.prev_altitude = 0.0
+        self.episode_start_time = time.time()
 
         # Revert to launch
         try:
@@ -128,13 +131,16 @@ class KSPEnv(gym.Env):
 
         # Termination conditions
         crashed = self._check_crash()
-        timeout = self.steps >= self.max_steps
+        timeout_steps = self.steps >= self.max_steps
+        timeout_time = (time.time() - self.episode_start_time) >= self.max_episode_time
 
-        if crashed or timeout or alt == 0:
+        if crashed or timeout_steps or timeout_time:
             self.done = True
-            print(f"[EPISODE END] Max Altitude: {self.episode_max_alt:.2f} m")
+            print(
+                f"[EPISODE END] Max Altitude: {self.episode_max_alt:.2f} m | Duration: {time.time() - self.episode_start_time:.1f} s"
+            )
             reward += self.episode_max_alt * 0.001
-            return obs, reward, crashed, timeout and not crashed, {"max_altitude": self.episode_max_alt}
+            return obs, reward, True, False, {"max_altitude": self.episode_max_alt}
 
         return obs, reward, False, False, {}
 
