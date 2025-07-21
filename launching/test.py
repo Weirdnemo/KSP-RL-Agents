@@ -1,4 +1,4 @@
-from ksp_env import KSPEnv
+from launching.ksp_env import KSPEnv
 import time
 from stable_baselines3 import PPO
 import numpy as np

@@ -52,7 +52,6 @@ def main():
     print("[INFO] Igniting...")
     control.throttle = 1.0
     control.activate_next_stage()  # launch
-    time.sleep(0.25)
 
     # Streams
     flight_srf = vessel.flight(vessel.surface_reference_frame)
