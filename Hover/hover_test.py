@@ -1,57 +1,71 @@
-import time
 import csv
-import numpy as np
+from pathlib import Path
 from stable_baselines3 import PPO
+
+# Assuming your refactored environment is in ksp_hover_env.py
 from ksp_hover_env import HoverEnv
 
-MODEL_PATH = "ppo_hover_agent_20000"
-CSV_LOG = "hover_test_log.csv"
+# --- Configuration ---
+# Make sure this path points to your trained agent .zip file
+MODEL_PATH = Path("checkpoints/ppo_hover_agent_final.zip") 
+# The name of the file where flight data will be saved
+OUTPUT_DATA_FILE = Path("flight_data.csv")
 
 
-def test_agent(episodes=1):
-    # Create environment
-    env = HoverEnv(step_sleep=0.2)
-    model = PPO.load(MODEL_PATH, env=env)
-    print(f"[INFO] Loaded model: {MODEL_PATH}")
+def test_and_record():
+    """Loads a trained PPO agent, runs one episode, and records the data."""
+    if not MODEL_PATH.exists():
+        print(f"❌ Error: Model file not found at {MODEL_PATH}")
+        print("Please make sure you have a trained agent .zip file at that location.")
+        return
 
-    for ep in range(1, episodes + 1):
-        obs, _ = env.reset()
-        done = False
-        ep_reward = 0.0
-        steps = 0
-        start_time = time.time()
+    print("🚀 Initializing environment for testing...")
+    env = HoverEnv()
 
-        # Prepare CSV for this episode
-        log_file = CSV_LOG.replace(".csv", f"_ep{ep}.csv")
-        with open(log_file, mode="w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["step", "time_s", "altitude_m", "thrust_command", "reward"])
+    print(f"🧠 Loading trained model from {MODEL_PATH}...")
+    model = PPO.load(MODEL_PATH)
 
-            print(f"\n=== TEST EPISODE {ep}/{episodes} ===")
-            print(f"Initial Obs: {obs}")
+    obs, info = env.reset()
+    
+    print("📋 Recording flight data to", OUTPUT_DATA_FILE)
+    with open(OUTPUT_DATA_FILE, "w", newline="") as f:
+        writer = csv.writer(f)
+        # Write the header row for the CSV file
+        writer.writerow([
+            "time_step", "altitude", "vertical_speed", "fuel", "throttle", "reward"
+        ])
 
-            while not done:
-                action, _ = model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = env.step(action)
-                ep_reward += reward
-                steps += 1
-                done = terminated or truncated
-
-                # Log to CSV
-                elapsed_time = time.time() - start_time
-                writer.writerow([steps, round(elapsed_time, 2), obs[0], action[0], reward])
-
-                time.sleep(0.1)  # Slow down for visualization
-
-        avg_reward = ep_reward / steps if steps > 0 else 0.0
-        print(
-            f"[EPISODE END] Steps={steps}, Total Reward={ep_reward:.2f}, "
-            f"Avg Reward/Step={avg_reward:.2f}, Max Altitude={info.get('max_altitude', 0):.2f} m"
-        )
-        print(f"[CSV LOG] Saved: {log_file}")
-
+        time_step = 0
+        while True:
+            # Use deterministic=True for testing to get the agent's "best" action
+            action, _ = model.predict(obs, deterministic=True)
+            
+            # Unpack the action to get the throttle value
+            throttle = action[0]
+            
+            # Take a step in the environment
+            obs, reward, terminated, truncated, info = env.step(action)
+            
+            # Get data from the observation array
+            altitude, vertical_speed, fuel = obs
+            
+            # Write the current step's data to the CSV
+            writer.writerow([
+                time_step, altitude, vertical_speed, fuel, throttle, reward
+            ])
+            
+            # Print real-time data to the console
+            env.render()
+            
+            time_step += 1
+            
+            if terminated or truncated:
+                break
+    
+    print("\n✅ Episode finished.")
+    print(f"Flight data successfully saved to {OUTPUT_DATA_FILE}")
     env.close()
 
 
 if __name__ == "__main__":
-    test_agent(episodes=1)
+    test_and_record()

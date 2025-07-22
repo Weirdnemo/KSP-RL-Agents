@@ -3,7 +3,6 @@ import csv
 import gymnasium as gym
 import numpy as np
 import krpc
-import os
 from pathlib import Path
 from typing import Tuple, Dict, Any
 
@@ -11,20 +10,12 @@ class HoverEnv(gym.Env):
     """
     A reinforcement learning environment for hovering a rocket in Kerbal Space Program (KSP).
 
-    The goal is to ascend to a target altitude and maintain a stable hover for as long as possible.
-
-    - **Observations**: [altitude (m), vertical_speed (m/s), fuel_fraction]
-    - **Actions**: [throttle] between 0.0 and 1.0.
-    - **Reward**: A combination of rewards for being at the target altitude and penalties
-      for vertical speed, fuel usage, and catastrophic failures (crashing/overshooting).
-    - **Termination**: Episode ends if the vessel crashes, goes too high, or runs out of fuel.
-    - **Truncation**: Episode is truncated if it exceeds the time limit.
+    The goal is to ascend to a target altitude and maintain a stable hover.
     """
     metadata = {"render_modes": ["human"]}
 
-# --- Configuration Constants ---
+    # --- Configuration Constants ---
     TARGET_ALTITUDE = 500.0  # meters
-    ALTITUDE_TOLERANCE = 100.0 # The "sweet spot" range around the target
     MAX_ALTITUDE_LIMIT = 1000.0
     CRASH_ALTITUDE = 1.0
     MAX_SPEED_LIMIT = 200.0
@@ -34,10 +25,10 @@ class HoverEnv(gym.Env):
     REWARD_ALTITUDE_SIGMA = 50.0  # Std deviation for Gaussian altitude reward
     REWARD_HOVER_BONUS = 2.0
     PENALTY_VELOCITY = 0.02
+    REWARD_ASCENT = 0.05       # New: Encourages climbing
     PENALTY_OVERSHOOT = -200.0
     PENALTY_CRASH = -200.0
     PENALTY_NO_FUEL = -100.0
-
 
     def __init__(self, step_sleep: float = 0.2, log_dir: str = "logs"):
         super().__init__()
@@ -70,7 +61,6 @@ class HoverEnv(gym.Env):
 
         self._reset_episode_state()
 
-        # Establish connection if it doesn't exist
         if not self.conn:
             try:
                 print("Connecting to kRPC server...")
@@ -80,34 +70,43 @@ class HoverEnv(gym.Env):
         
         self.sc = self.conn.space_center
 
-        # Reset simulation to launchpad
         try:
             self.sc.revert_to_launch()
         except RuntimeError:
             print("[WARN] Revert to launch failed. Attempting to load quicksave.")
             self.sc.load("quicksave")
         
-        time.sleep(3) # Allow time for scene to load
+        time.sleep(3) 
         self._wait_for_prelaunch()
 
-        # Bind to the active vessel and set up data streams
         self._bind_vessel_and_streams()
 
-        # Pre-launch sequence
         self.vessel.control.sas = True
         self.vessel.control.throttle = 0.0
         self.vessel.control.activate_next_stage()
 
         obs = self._get_obs()
         return obs, {}
+    
+    def archive_log_file(self, archive_step_count: int):
+        """Renames the current flight log to an archive and starts a new one."""
+        if self.flight_log_file.exists() and self.flight_log_file.stat().st_size > 0:
+            archive_name = self.flight_log_file.with_name(
+                f"hover_flight_log_steps_{archive_step_count}.csv"
+            )
+            self.flight_log_file.replace(archive_name)
+            if self.vessel: # A check to see if we are in an active episode
+                print(f"🗄️  Archived flight log to {archive_name}")
+            # Start a new log file for the next segment of training
+            self._init_flight_log()
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """Advance the environment by one time step."""
         throttle = float(np.clip(action[0], 0, 1))
         try:
             self.vessel.control.throttle = throttle
-        except krpc.error.RPCError: # Catches issues if vessel is destroyed
-            obs = self._get_obs() # This will return a zeroed-out observation
+        except krpc.error.RPCError:
+            obs = self._get_obs()
             return obs, self.PENALTY_CRASH, True, False, {"reason": "Vessel destroyed"}
 
         time.sleep(self.step_sleep)
@@ -115,8 +114,8 @@ class HoverEnv(gym.Env):
         obs = self._get_obs()
         alt, v_speed, fuel_frac = obs
 
-        terminated, truncation_reason = self._check_termination(alt, v_speed, fuel_frac)
-        reward = self._compute_reward(alt, v_speed, fuel_frac, terminated, truncation_reason)
+        terminated, term_reason = self._check_termination(alt, v_speed, fuel_frac)
+        reward = self._compute_reward(alt, v_speed, fuel_frac, terminated, term_reason)
         self.episode_reward += reward
 
         truncated = (time.time() - self.start_time) >= self.EPISODE_TIME_LIMIT
@@ -129,7 +128,7 @@ class HoverEnv(gym.Env):
         info = {
             "max_altitude": self.max_altitude,
             "altitude_error": abs(alt - self.TARGET_ALTITUDE),
-            "termination_reason": truncation_reason
+            "termination_reason": term_reason
         }
         
         return obs, reward, terminated, truncated, info
@@ -143,7 +142,7 @@ class HoverEnv(gym.Env):
                 return self.PENALTY_OVERSHOOT
             if reason == "out_of_fuel":
                 return self.PENALTY_NO_FUEL
-            return 0.0 # Should not happen
+            return 0.0
 
         # Gaussian reward for being near the target altitude
         altitude_error = alt - self.TARGET_ALTITUDE
@@ -151,23 +150,24 @@ class HoverEnv(gym.Env):
         
         # Penalty for vertical speed to encourage hovering
         velocity_penalty = self.PENALTY_VELOCITY * abs(v_speed)
+
+        # Reward for moving upward to encourage exploration
+        ascent_reward = max(0, v_speed * self.REWARD_ASCENT)
         
-        reward = altitude_reward - velocity_penalty
+        # Combine the rewards
+        reward = altitude_reward - velocity_penalty + ascent_reward
         return reward
 
     def _check_termination(self, alt: float, v_speed: float, fuel_frac: float) -> Tuple[bool, str]:
         """Checks for episode termination conditions."""
-        if alt <= self.CRASH_ALTITUDE and self.steps > 1: # Crashed back to the ground
+        if alt <= self.CRASH_ALTITUDE and self.steps > 1:
             return True, "crashed"
-        if alt > self.MAX_ALTITUDE_LIMIT: # Flew too high
+        if alt > self.MAX_ALTITUDE_LIMIT:
             return True, "overshot"
-        if fuel_frac <= 0 and alt > self.CRASH_ALTITUDE: # Ran out of fuel mid-air
+        if fuel_frac <= 0 and alt > self.CRASH_ALTITUDE:
             return True, "out_of_fuel"
         return False, ""
 
-    # ------------------------
-    # Helper Methods
-    # ------------------------
     def _reset_episode_state(self):
         """Resets variables that track episode progress."""
         self.steps = 0
@@ -180,7 +180,6 @@ class HoverEnv(gym.Env):
         self.vessel = self.sc.active_vessel
         flight = self.vessel.flight(self.vessel.orbit.body.reference_frame)
 
-        # Create streams for performance
         self.altitude_s = self.conn.add_stream(getattr, flight, 'mean_altitude')
         self.vspeed_s = self.conn.add_stream(getattr, flight, 'vertical_speed')
         
@@ -196,7 +195,6 @@ class HoverEnv(gym.Env):
                 self.fuel_s() / self.fuel_max
             ], dtype=np.float32)
         except (krpc.error.RPCError, krpc.error.StreamError):
-            # If stream fails (e.g., vessel destroyed), return a zeroed state
             obs = np.zeros(self.observation_space.shape, dtype=np.float32)
         
         return np.clip(obs, self.observation_space.low, self.observation_space.high)
@@ -209,13 +207,10 @@ class HoverEnv(gym.Env):
                 if self.sc.active_vessel and self.sc.active_vessel.situation.name == 'pre_launch':
                     return
             except krpc.error.RPCError:
-                pass # Ignore errors during scene transitions
+                pass 
             time.sleep(0.5)
         raise TimeoutError("Timed out waiting for pre-launch state.")
     
-    # ------------------------
-    # Logging & Rendering
-    # ------------------------
     def _init_flight_log(self):
         """Creates the header for the flight log CSV file."""
         with open(self.flight_log_file, "w", newline="") as f:

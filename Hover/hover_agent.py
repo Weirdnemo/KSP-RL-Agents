@@ -4,21 +4,20 @@ from typing import Optional
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 
-# Assuming your refactored environment is in ksp_hover_env.py
 from ksp_hover_env import HoverEnv
 
 # --- Configuration ---
 MODEL_DIR = Path("checkpoints")
-TOTAL_TIMESTEPS = 20_000
-SAVE_INTERVAL = 2_000  # Save a checkpoint every N steps
+TOTAL_TIMESTEPS = 30_000
+SAVE_INTERVAL = 2_000      # Save a model checkpoint every 2k steps
+LOG_SAVE_INTERVAL = 5_000  # Archive the CSV flight log every 5k steps
 
 # Group PPO hyperparameters in a dictionary for clarity
 PPO_KWARGS = {
-    "learning_rate": 3e-4,  # 0.0003
-    "n_steps": 1024,        # Number of steps to run for each environment per update
+    "learning_rate": 3e-4,
+    "n_steps": 1024,
     "batch_size": 64,
     "n_epochs": 10,
     "gamma": 0.99,
@@ -29,37 +28,43 @@ PPO_KWARGS = {
 # --- Helper Function to Resume Training ---
 
 def find_latest_checkpoint(model_dir: Path) -> Optional[Path]:
-    """Finds the latest PPO checkpoint in a directory based on the timestep in the filename."""
+    """Finds the latest PPO checkpoint in a directory."""
     try:
         checkpoints = list(model_dir.glob("ppo_hover_agent_*.zip"))
         if not checkpoints:
             return None
-        # Sort checkpoints by the timestep number in the filename
         latest_checkpoint = max(checkpoints, key=lambda p: int(p.stem.split('_')[-1]))
         return latest_checkpoint
     except (ValueError, IndexError):
-        # In case filenames are not in the expected format
         return None
 
-# --- Custom Callback for Saving ---
+# --- Custom Callback for Saving Model and Logs ---
 
-class SaveOnStepCallback(BaseCallback):
+class CustomCallback(BaseCallback):
     """
-    A custom callback that saves the model at regular intervals.
-    Note: Episode logging is now handled automatically by the VecMonitor wrapper.
+    Custom callback to save the model and archive logs at different intervals.
     """
-    def __init__(self, save_freq: int, save_path: Path, verbose: int = 1):
+    def __init__(self, save_freq: int, log_save_freq: int, save_path: Path, verbose: int = 1):
         super().__init__(verbose)
         self.save_freq = save_freq
+        self.log_save_freq = log_save_freq
         self.save_path = save_path
 
     def _on_step(self) -> bool:
-        # Check if it's time to save
+        # Save the model checkpoint
         if self.num_timesteps % self.save_freq == 0:
             path = self.save_path / f"ppo_hover_agent_{self.num_timesteps}.zip"
             self.model.save(path)
             if self.verbose > 0:
-                print(f"💾 [MODEL SAVE] Saved model checkpoint to {path}")
+                print(f"💾 Saved model checkpoint to {path}")
+        
+        # Archive the flight log
+        if self.num_timesteps > 0 and self.num_timesteps % self.log_save_freq == 0:
+            # Access the underlying environment to call its archive method
+            underlying_env = self.training_env.envs[0]
+            if hasattr(underlying_env, 'archive_log_file'):
+                underlying_env.archive_log_file(self.num_timesteps)
+
         return True
 
 # --- Main Training Function ---
@@ -68,8 +73,7 @@ def train_agent():
     """Initializes the environment, model, and starts the training process."""
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Standard practice: wrap the environment for Stable Baselines3
-    # VecMonitor handles episode statistics like reward and length automatically.
+    # Wrap the environment for Stable Baselines3
     env = VecMonitor(DummyVecEnv([lambda: HoverEnv()]))
 
     model: PPO
@@ -78,7 +82,6 @@ def train_agent():
     if latest_checkpoint:
         print(f"✅ Resuming training from checkpoint: {latest_checkpoint}")
         model = PPO.load(latest_checkpoint, env=env)
-        # Reset the total timesteps to continue from the checkpoint's progress
         initial_timesteps = int(latest_checkpoint.stem.split('_')[-1])
         remaining_timesteps = TOTAL_TIMESTEPS - initial_timesteps
         if remaining_timesteps <= 0:
@@ -90,10 +93,13 @@ def train_agent():
         model = PPO("MlpPolicy", env, verbose=1, **PPO_KWARGS)
         remaining_timesteps = TOTAL_TIMESTEPS
 
-    callback = SaveOnStepCallback(save_freq=SAVE_INTERVAL, save_path=MODEL_DIR)
+    callback = CustomCallback(
+        save_freq=SAVE_INTERVAL,
+        log_save_freq=LOG_SAVE_INTERVAL,
+        save_path=MODEL_DIR
+    )
 
     try:
-        # The `reset_num_timesteps=False` is crucial for resuming training
         model.learn(
             total_timesteps=remaining_timesteps,
             callback=callback,
@@ -103,12 +109,12 @@ def train_agent():
     except KeyboardInterrupt:
         print("\n🛑 Training interrupted by user.")
     finally:
-        # Save the final model regardless of how training ended
+        # Save final model and archive final log
+        env.envs[0].archive_log_file(model.num_timesteps) # Final log archive
         final_model_path = MODEL_DIR / f"ppo_hover_agent_final_{model.num_timesteps}.zip"
         model.save(final_model_path)
         print(f"💾 Final model saved at: {final_model_path}")
         env.close()
-
 
 if __name__ == "__main__":
     train_agent()

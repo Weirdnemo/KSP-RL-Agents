@@ -12,3 +12,4 @@ launching/ppo_ksp_altitude.zip
 ppo_ksp_altitude.zip
 Hover/checkpoints
 Hover/training_logs
+Hover/logs/hover_flight_log.csv
