@@ -1,17 +1,30 @@
 # 🚀 KSP Hover Agent
 
-This project trains a reinforcement learning (PPO) agent to control a rocket in Kerbal Space Program (KSP) using the kRPC API. The agent learns to reach and hover around a target altitude of 500m while minimizing overshoot and maintaining stability.
+This project trains a reinforcement learning (PPO) agent to control a rocket in Kerbal Space Program (KSP) using the kRPC API.  
+The agent learns to reach and hover around a target altitude of **200m** while minimizing overshoot and maintaining stability.
 
 ---
 
 ## 📹 Demo Video
-[![Watch the video](KSP/showcase/trained-16k.png)](https://youtu.be/rWP7ViwXaMM)
+(youtube)
+
+<p align="center">
+  <a href="https://youtu.be/rWP7ViwXaMM" target="_blank">
+    <img src="/showcase/Frontface.png" alt="Watch the video" width="70%">
+  </a>
+</p>
 
 ---
 
 ## 🖼 Screenshots
+
 ### Untrained Rocket
-![Untrained Rocket](/showcase/untrained.png)
+<p align="center">
+  <img src="/showcase/untrained.png" alt="Untrained Rocket" width="60%">
+</p>
 
 ### Trained Rocket
-![Trained Rocket](/showcase/trained-16k.png)
+<p align="center">
+  <img src="/showcase/trained-16k.png" alt="Trained Rocket" width="60%">
+</p>
+
