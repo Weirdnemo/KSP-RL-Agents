@@ -11,7 +11,7 @@ LOG_DIR = "training_logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # ---------------------------------------------------
-# Callback to Save Model Every 2k and Flight Logs Every 10k
+# Custom Callback: Save Model, CSV, and Print Episode Info
 # ---------------------------------------------------
 class SaveModelAndCSVCallback(BaseCallback):
     def __init__(self, model_save_freq=2_000, log_save_freq=10_000, log_dir=LOG_DIR, verbose=1):
@@ -19,9 +19,25 @@ class SaveModelAndCSVCallback(BaseCallback):
         self.model_save_freq = model_save_freq
         self.log_save_freq = log_save_freq
         self.log_dir = log_dir
+
         self.csv_file = None
         self.csv_writer = None
         self.current_log_path = None
+
+        # Episode stats
+        self.episode_reward = 0.0
+        self.episode_steps = 0
+        self.episode_start_time = 0
+        self.max_apoapsis = 0.0
+        self.vertical_speeds = []
+
+    def _on_rollout_start(self) -> None:
+        """Called at the start of each rollout (approx. each episode)."""
+        self.episode_reward = 0.0
+        self.episode_steps = 0
+        self.episode_start_time = time.time()
+        self.max_apoapsis = 0.0
+        self.vertical_speeds = []
 
     def _on_step(self) -> bool:
         steps = self.num_timesteps
@@ -43,7 +59,6 @@ class SaveModelAndCSVCallback(BaseCallback):
             self.csv_file = open(log_file, "w", newline="")
             self.csv_writer = csv.writer(self.csv_file)
             self.csv_writer.writerow(["step", "time_s", "apoapsis_m", "v_speed_mps", "throttle"])
-
             if self.verbose > 0:
                 print(f"[CSV] Starting log file: {log_file}")
 
@@ -54,7 +69,27 @@ class SaveModelAndCSVCallback(BaseCallback):
             step_time = time.time() - env.start_time
             self.csv_writer.writerow([steps, step_time, obs[0], obs[1], env.control.throttle])
 
+        # Update episode stats
+        reward = float(self.locals.get("rewards", [0])[0])
+        self.episode_reward += reward
+        self.episode_steps += 1
+        obs = self.training_env.envs[0].env._get_obs()
+        self.vertical_speeds.append(obs[1])
+        self.max_apoapsis = max(self.max_apoapsis, obs[0])
+
         return True
+
+    def _on_rollout_end(self) -> None:
+        """Print episode summary when the rollout (episode) ends."""
+        avg_v_speed = np.mean(self.vertical_speeds) if self.vertical_speeds else 0.0
+        ep_time = time.time() - self.episode_start_time
+        print(
+            f"[EPISODE DONE] Steps={self.episode_steps}, "
+            f"Reward={self.episode_reward:.2f}, "
+            f"Max Apoapsis={self.max_apoapsis:.1f}m, "
+            f"Avg VSpeed={avg_v_speed:.2f} m/s, "
+            f"Time={ep_time:.1f}s"
+        )
 
     def _on_training_end(self) -> None:
         if self.csv_file:
