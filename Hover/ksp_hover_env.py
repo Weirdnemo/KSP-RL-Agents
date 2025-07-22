@@ -1,24 +1,33 @@
 import time
+import csv
 import gymnasium as gym
 import numpy as np
 import krpc
+import os
 
 
 class HoverEnv(gym.Env):
     """
-    Hover environment for KSP using apoapsis control.
-    Goal: Keep apoapsis near 500 m and maintain low vertical speed (<5 m/s).
-    Observations: [apoapsis, vertical_speed, fuel_frac]
+    Hover environment for KSP.
+    Goal: Reach ~500 m altitude and hover as long as possible.
+    Observations: [altitude, vertical_speed, fuel_frac]
     Actions: [throttle] in [0, 1].
+    Reward: Gaussian reward near 500 m, penalties for overshoot/crash.
     """
 
-    metadata = {"render.modes": ["human"]}
+    metadata = {"render_modes": ["human"]}
 
-    def __init__(self, step_sleep=0.2, max_steps=500):
+    def __init__(self, step_sleep=0.2, max_steps=500, log_interval=10_000):
         super().__init__()
         self.step_sleep = step_sleep
         self.max_steps = max_steps
         self.episode_time_limit = 40.0  # seconds
+        self.log_interval = log_interval
+
+        # Logging
+        self.global_steps = 0
+        self.flight_log_file = "hover_flight_log.csv"
+        self._init_flight_log()
 
         # KRPC setup
         self.conn = krpc.connect(name="KSP Hover Env")
@@ -33,13 +42,13 @@ class HoverEnv(gym.Env):
             dtype=np.float32
         )
         self.observation_space = gym.spaces.Box(
-            low=np.array([0.0, -100.0, 0.0], dtype=np.float32),
-            high=np.array([1000.0, 100.0, 1.0], dtype=np.float32),
+            low=np.array([0.0, -200.0, 0.0], dtype=np.float32),
+            high=np.array([1000.0, 200.0, 1.0], dtype=np.float32),
             dtype=np.float32
         )
 
         # Streams
-        self.apoapsis_s = None
+        self.altitude_s = None
         self.vspeed_s = None
         self.fuel_s = None
         self.fuel_max = 1.0
@@ -47,8 +56,9 @@ class HoverEnv(gym.Env):
         # Episode state
         self.steps = 0
         self.start_time = 0
-        self.max_apoapsis = 0.0
+        self.max_altitude = 0.0
         self.done = False
+        self.episode_reward = 0.0
 
         # Bind vessel and streams
         self._bind_vessel()
@@ -59,10 +69,14 @@ class HoverEnv(gym.Env):
     # ------------------------
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
+        if self.steps > 0:
+            print(f"[EP DONE] steps={self.steps}, total_reward={self.episode_reward:.2f}, max_alt={self.max_altitude:.1f}m")
+
         self.done = False
         self.steps = 0
+        self.episode_reward = 0.0
         self.start_time = time.time()
-        self.max_apoapsis = 0.0
+        self.max_altitude = 0.0
 
         try:
             self.sc.revert_to_launch()
@@ -76,6 +90,7 @@ class HoverEnv(gym.Env):
         self._bind_vessel()
         self._make_streams()
 
+        # Activate SAS & engine
         self.control.sas = True
         self.control.throttle = 0.0
         self.control.activate_next_stage()
@@ -88,46 +103,85 @@ class HoverEnv(gym.Env):
     # ------------------------
     def step(self, action):
         if self.done:
-            return self._get_obs(), 0.0, True, False, {"max_apoapsis": self.max_apoapsis}
+            return self._get_obs(), 0.0, True, False, {"max_altitude": self.max_altitude}
 
         throttle = float(np.clip(action[0], 0.0, 1.0))
         self.control.throttle = throttle
         time.sleep(self.step_sleep)
 
         obs = self._get_obs()
-        apo, vspd = obs[0], obs[1]
+        alt, vspd = obs[0], obs[1]
 
-        # Update max apoapsis
-        if apo > self.max_apoapsis:
-            self.max_apoapsis = apo
+        # Update max altitude
+        if alt > self.max_altitude:
+            self.max_altitude = alt
 
-        # Reward logic
-        reward = 0.0
-        apo_error = abs(apo - 500)
-        reward -= apo_error * 0.05  # penalty for being away from 500
+        # Compute reward
+        reward, altitude_error = self._compute_reward(alt, vspd)
+        self.episode_reward += reward
 
-        if 450 <= apo <= 525:
-            reward += 10.0 - apo_error * 0.1  # strong reward near 500
+        # Log step
+        self._log_step(alt, throttle, reward)
 
-        # Vertical speed penalty
-        if apo < 510:  # only damp vertical speed if close
-            reward -= abs(vspd) * 0.1
-
-        # Termination conditions
-        if apo > 600 or (apo < 350 and self.vspeed_s() < -5):
-            reward -= 200.0
-            self.done = True
-
+        # Check time-based termination
         elapsed = time.time() - self.start_time
         if elapsed >= self.episode_time_limit:
             self.done = True
 
         self.steps += 1
+        self.global_steps += 1
+
         return obs, reward, self.done, False, {
-            "max_apoapsis": self.max_apoapsis,
+            "max_altitude": self.max_altitude,
             "elapsed_time": elapsed,
-            "apo_error": apo_error
+            "altitude_error": altitude_error
         }
+
+    # ------------------------
+    # REWARD FUNCTION
+    # ------------------------
+    def _compute_reward(self, alt, vspd):
+        altitude_error = abs(alt - 500)
+        reward = -0.01 * (altitude_error ** 2)
+
+        if 450 <= alt <= 550:
+            reward += 5.0 - 0.1 * altitude_error
+
+        if 450 <= alt <= 550:
+            reward -= abs(vspd) * 0.5
+
+        if alt > 400 and vspd > 15:
+            reward -= (vspd - 15) * 0.5
+
+        if alt > 600:
+            reward -= 200.0
+            self.done = True
+
+        if self._check_crash():
+            reward -= 200.0
+            self.done = True
+
+        return reward, altitude_error
+
+    # ------------------------
+    # LOGGING
+    # ------------------------
+    def _init_flight_log(self):
+        with open(self.flight_log_file, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["global_step", "altitude_m", "throttle", "reward"])
+
+    def _log_step(self, altitude, throttle, reward):
+        with open(self.flight_log_file, mode="a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([self.global_steps, altitude, throttle, reward])
+
+        # Save a checkpoint CSV every 10k steps
+        if self.global_steps % self.log_interval == 0:
+            backup_name = f"hover_flight_log_{self.global_steps//1000}k.csv"
+            os.replace(self.flight_log_file, backup_name)
+            self._init_flight_log()
+            print(f"[LOG] Saved flight log to {backup_name}")
 
     # ------------------------
     # RENDER
@@ -135,7 +189,7 @@ class HoverEnv(gym.Env):
     def render(self, mode="human"):
         obs = self._get_obs()
         print(
-            f"Step {self.steps} | Apoapsis: {obs[0]:.1f} m | Vspd: {obs[1]:.1f} m/s | Fuel: {obs[2]:.2f} | MaxApo: {self.max_apoapsis:.1f} m"
+            f"Step {self.steps} | Alt: {obs[0]:.1f} m | Vspd: {obs[1]:.1f} m/s | Fuel: {obs[2]:.2f} | MaxAlt: {self.max_altitude:.1f} m"
         )
 
     # ------------------------
@@ -168,9 +222,8 @@ class HoverEnv(gym.Env):
             time.sleep(poll)
 
     def _make_streams(self):
-        orbit = self.vessel.orbit
         flight = self.vessel.flight()
-        self.apoapsis_s = self.conn.add_stream(getattr, orbit, "apoapsis_altitude")
+        self.altitude_s = self.conn.add_stream(getattr, flight, "mean_altitude")
         self.vspeed_s = self.conn.add_stream(getattr, flight, "vertical_speed")
         self.fuel_max = max(1.0, self.vessel.resources.max("LiquidFuel"))
         self.fuel_s = self.conn.add_stream(self.vessel.resources.amount, "LiquidFuel")
@@ -183,11 +236,19 @@ class HoverEnv(gym.Env):
 
     def _get_obs(self):
         try:
-            apo = float(self.apoapsis_s())
+            alt = float(self.altitude_s())
             vspd = float(self.vspeed_s())
             fuel = self._fuel_frac()
         except Exception:
-            apo, vspd, fuel = 0, 0, 0
+            alt, vspd, fuel = 0, 0, 0
             self.done = True
-        obs = np.array([apo, vspd, fuel], dtype=np.float32)
+        obs = np.array([alt, vspd, fuel], dtype=np.float32)
         return np.clip(obs, self.observation_space.low, self.observation_space.high)
+
+    def _check_crash(self):
+        try:
+            if self.altitude_s() <= 1.0:
+                return True
+        except Exception:
+            return True
+        return False
