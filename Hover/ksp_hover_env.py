@@ -4,251 +4,244 @@ import gymnasium as gym
 import numpy as np
 import krpc
 import os
-
+from pathlib import Path
+from typing import Tuple, Dict, Any
 
 class HoverEnv(gym.Env):
     """
-    Hover environment for KSP.
-    Goal: Reach ~500 m altitude and hover as long as possible.
-    Observations: [altitude, vertical_speed, fuel_frac]
-    Actions: [throttle] in [0, 1].
-    Reward: Gaussian reward near 500 m, penalties for overshoot/crash.
-    """
+    A reinforcement learning environment for hovering a rocket in Kerbal Space Program (KSP).
 
+    The goal is to ascend to a target altitude and maintain a stable hover for as long as possible.
+
+    - **Observations**: [altitude (m), vertical_speed (m/s), fuel_fraction]
+    - **Actions**: [throttle] between 0.0 and 1.0.
+    - **Reward**: A combination of rewards for being at the target altitude and penalties
+      for vertical speed, fuel usage, and catastrophic failures (crashing/overshooting).
+    - **Termination**: Episode ends if the vessel crashes, goes too high, or runs out of fuel.
+    - **Truncation**: Episode is truncated if it exceeds the time limit.
+    """
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, step_sleep=0.2, max_steps=500, log_interval=10_000):
+# --- Configuration Constants ---
+    TARGET_ALTITUDE = 500.0  # meters
+    ALTITUDE_TOLERANCE = 100.0 # The "sweet spot" range around the target
+    MAX_ALTITUDE_LIMIT = 1000.0
+    CRASH_ALTITUDE = 1.0
+    MAX_SPEED_LIMIT = 200.0
+    EPISODE_TIME_LIMIT = 60.0  # seconds
+
+    # --- Reward Shaping Constants ---
+    REWARD_ALTITUDE_SIGMA = 50.0  # Std deviation for Gaussian altitude reward
+    REWARD_HOVER_BONUS = 2.0
+    PENALTY_VELOCITY = 0.02
+    PENALTY_OVERSHOOT = -200.0
+    PENALTY_CRASH = -200.0
+    PENALTY_NO_FUEL = -100.0
+
+
+    def __init__(self, step_sleep: float = 0.2, log_dir: str = "logs"):
         super().__init__()
         self.step_sleep = step_sleep
-        self.max_steps = max_steps
-        self.episode_time_limit = 40.0  # seconds
-        self.log_interval = log_interval
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.flight_log_file = self.log_dir / "hover_flight_log.csv"
+        
+        # Action space: [throttle]
+        self.action_space = gym.spaces.Box(
+            low=np.array([0.0]), high=np.array([1.0]), dtype=np.float32
+        )
+        # Observation space: [altitude, vertical_speed, fuel_fraction]
+        obs_low = np.array([0.0, -self.MAX_SPEED_LIMIT, 0.0], dtype=np.float32)
+        obs_high = np.array([self.MAX_ALTITUDE_LIMIT, self.MAX_SPEED_LIMIT, 1.0], dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
 
-        # Logging
-        self.global_steps = 0
-        self.flight_log_file = "hover_flight_log.csv"
+        # KRPC and episode state are initialized in reset()
+        self.conn = None
+        self.vessel = None
+        self._reset_episode_state()
         self._init_flight_log()
 
-        # KRPC setup
-        self.conn = krpc.connect(name="KSP Hover Env")
-        self.sc = self.conn.space_center
-        self.vessel = None
-        self.control = None
-
-        # Action and observation spaces
-        self.action_space = gym.spaces.Box(
-            low=np.array([0.0], dtype=np.float32),
-            high=np.array([1.0], dtype=np.float32),
-            dtype=np.float32
-        )
-        self.observation_space = gym.spaces.Box(
-            low=np.array([0.0, -200.0, 0.0], dtype=np.float32),
-            high=np.array([1000.0, 200.0, 1.0], dtype=np.float32),
-            dtype=np.float32
-        )
-
-        # Streams
-        self.altitude_s = None
-        self.vspeed_s = None
-        self.fuel_s = None
-        self.fuel_max = 1.0
-
-        # Episode state
-        self.steps = 0
-        self.start_time = 0
-        self.max_altitude = 0.0
-        self.done = False
-        self.episode_reward = 0.0
-
-        # Bind vessel and streams
-        self._bind_vessel()
-        self._make_streams()
-
-    # ------------------------
-    # RESET
-    # ------------------------
-    def reset(self, *, seed=None, options=None):
+    def reset(self, *, seed: int | None = None, options: Dict[str, Any] | None = None) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Resets the environment to the initial state for a new episode."""
         super().reset(seed=seed)
-        if self.steps > 0:
-            print(f"[EP DONE] steps={self.steps}, total_reward={self.episode_reward:.2f}, max_alt={self.max_altitude:.1f}m")
 
-        self.done = False
+        if self.vessel: # Print summary of the previous episode
+            print(f"[EPISODE DONE] Steps={self.steps}, Reward={self.episode_reward:.2f}, MaxAlt={self.max_altitude:.1f}m")
+
+        self._reset_episode_state()
+
+        # Establish connection if it doesn't exist
+        if not self.conn:
+            try:
+                print("Connecting to kRPC server...")
+                self.conn = krpc.connect(name="KSP Hover Env")
+            except krpc.error.ConnectionError as e:
+                raise RuntimeError("Could not connect to kRPC server. Is KSP running with the server active?") from e
+        
+        self.sc = self.conn.space_center
+
+        # Reset simulation to launchpad
+        try:
+            self.sc.revert_to_launch()
+        except RuntimeError:
+            print("[WARN] Revert to launch failed. Attempting to load quicksave.")
+            self.sc.load("quicksave")
+        
+        time.sleep(3) # Allow time for scene to load
+        self._wait_for_prelaunch()
+
+        # Bind to the active vessel and set up data streams
+        self._bind_vessel_and_streams()
+
+        # Pre-launch sequence
+        self.vessel.control.sas = True
+        self.vessel.control.throttle = 0.0
+        self.vessel.control.activate_next_stage()
+
+        obs = self._get_obs()
+        return obs, {}
+
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        """Advance the environment by one time step."""
+        throttle = float(np.clip(action[0], 0, 1))
+        try:
+            self.vessel.control.throttle = throttle
+        except krpc.error.RPCError: # Catches issues if vessel is destroyed
+            obs = self._get_obs() # This will return a zeroed-out observation
+            return obs, self.PENALTY_CRASH, True, False, {"reason": "Vessel destroyed"}
+
+        time.sleep(self.step_sleep)
+
+        obs = self._get_obs()
+        alt, v_speed, fuel_frac = obs
+
+        terminated, truncation_reason = self._check_termination(alt, v_speed, fuel_frac)
+        reward = self._compute_reward(alt, v_speed, fuel_frac, terminated, truncation_reason)
+        self.episode_reward += reward
+
+        truncated = (time.time() - self.start_time) >= self.EPISODE_TIME_LIMIT
+
+        self._log_step(alt, throttle, reward)
+        self.steps += 1
+        if alt > self.max_altitude:
+            self.max_altitude = alt
+
+        info = {
+            "max_altitude": self.max_altitude,
+            "altitude_error": abs(alt - self.TARGET_ALTITUDE),
+            "termination_reason": truncation_reason
+        }
+        
+        return obs, reward, terminated, truncated, info
+
+    def _compute_reward(self, alt: float, v_speed: float, fuel_frac: float, terminated: bool, reason: str) -> float:
+        """Calculates the reward for the current state."""
+        if terminated:
+            if reason == "crashed":
+                return self.PENALTY_CRASH
+            if reason == "overshot":
+                return self.PENALTY_OVERSHOOT
+            if reason == "out_of_fuel":
+                return self.PENALTY_NO_FUEL
+            return 0.0 # Should not happen
+
+        # Gaussian reward for being near the target altitude
+        altitude_error = alt - self.TARGET_ALTITUDE
+        altitude_reward = self.REWARD_HOVER_BONUS * np.exp(-0.5 * (altitude_error / self.REWARD_ALTITUDE_SIGMA)**2)
+        
+        # Penalty for vertical speed to encourage hovering
+        velocity_penalty = self.PENALTY_VELOCITY * abs(v_speed)
+        
+        reward = altitude_reward - velocity_penalty
+        return reward
+
+    def _check_termination(self, alt: float, v_speed: float, fuel_frac: float) -> Tuple[bool, str]:
+        """Checks for episode termination conditions."""
+        if alt <= self.CRASH_ALTITUDE and self.steps > 1: # Crashed back to the ground
+            return True, "crashed"
+        if alt > self.MAX_ALTITUDE_LIMIT: # Flew too high
+            return True, "overshot"
+        if fuel_frac <= 0 and alt > self.CRASH_ALTITUDE: # Ran out of fuel mid-air
+            return True, "out_of_fuel"
+        return False, ""
+
+    # ------------------------
+    # Helper Methods
+    # ------------------------
+    def _reset_episode_state(self):
+        """Resets variables that track episode progress."""
         self.steps = 0
         self.episode_reward = 0.0
         self.start_time = time.time()
         self.max_altitude = 0.0
 
-        try:
-            self.sc.revert_to_launch()
-        except Exception as e:
-            print(f"[WARN] revert_to_launch failed: {e}. Trying quicksave.")
-            self.sc.load("quicksave")
-
-        time.sleep(5)
-        self._wait_for_prelaunch()
-
-        self._bind_vessel()
-        self._make_streams()
-
-        # Activate SAS & engine
-        self.control.sas = True
-        self.control.throttle = 0.0
-        self.control.activate_next_stage()
-
-        obs = self._get_obs()
-        return obs, {}
-
-    # ------------------------
-    # STEP
-    # ------------------------
-    def step(self, action):
-        if self.done:
-            return self._get_obs(), 0.0, True, False, {"max_altitude": self.max_altitude}
-
-        throttle = float(np.clip(action[0], 0.0, 1.0))
-        self.control.throttle = throttle
-        time.sleep(self.step_sleep)
-
-        obs = self._get_obs()
-        alt, vspd = obs[0], obs[1]
-
-        # Update max altitude
-        if alt > self.max_altitude:
-            self.max_altitude = alt
-
-        # Compute reward
-        reward, altitude_error = self._compute_reward(alt, vspd)
-        self.episode_reward += reward
-
-        # Log step
-        self._log_step(alt, throttle, reward)
-
-        # Check time-based termination
-        elapsed = time.time() - self.start_time
-        if elapsed >= self.episode_time_limit:
-            self.done = True
-
-        self.steps += 1
-        self.global_steps += 1
-
-        return obs, reward, self.done, False, {
-            "max_altitude": self.max_altitude,
-            "elapsed_time": elapsed,
-            "altitude_error": altitude_error
-        }
-
-    # ------------------------
-    # REWARD FUNCTION
-    # ------------------------
-    def _compute_reward(self, alt, vspd):
-        altitude_error = abs(alt - 500)
-        reward = -0.01 * (altitude_error ** 2)
-
-        if 450 <= alt <= 550:
-            reward += 5.0 - 0.1 * altitude_error
-
-        if 450 <= alt <= 550:
-            reward -= abs(vspd) * 0.5
-
-        if alt > 400 and vspd > 15:
-            reward -= (vspd - 15) * 0.5
-
-        if alt > 600:
-            reward -= 200.0
-            self.done = True
-
-        if self._check_crash():
-            reward -= 200.0
-            self.done = True
-
-        return reward, altitude_error
-
-    # ------------------------
-    # LOGGING
-    # ------------------------
-    def _init_flight_log(self):
-        with open(self.flight_log_file, mode="w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["global_step", "altitude_m", "throttle", "reward"])
-
-    def _log_step(self, altitude, throttle, reward):
-        with open(self.flight_log_file, mode="a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([self.global_steps, altitude, throttle, reward])
-
-        # Save a checkpoint CSV every 10k steps
-        if self.global_steps % self.log_interval == 0:
-            backup_name = f"hover_flight_log_{self.global_steps//1000}k.csv"
-            os.replace(self.flight_log_file, backup_name)
-            self._init_flight_log()
-            print(f"[LOG] Saved flight log to {backup_name}")
-
-    # ------------------------
-    # RENDER
-    # ------------------------
-    def render(self, mode="human"):
-        obs = self._get_obs()
-        print(
-            f"Step {self.steps} | Alt: {obs[0]:.1f} m | Vspd: {obs[1]:.1f} m/s | Fuel: {obs[2]:.2f} | MaxAlt: {self.max_altitude:.1f} m"
-        )
-
-    # ------------------------
-    # CLOSE
-    # ------------------------
-    def close(self):
-        try:
-            self.conn.close()
-        except Exception:
-            pass
-
-    # ------------------------
-    # Helpers
-    # ------------------------
-    def _bind_vessel(self):
+    def _bind_vessel_and_streams(self):
+        """Binds to the active vessel and creates kRPC data streams."""
         self.vessel = self.sc.active_vessel
-        self.control = self.vessel.control
+        flight = self.vessel.flight(self.vessel.orbit.body.reference_frame)
 
-    def _wait_for_prelaunch(self, poll=0.5, timeout=20):
-        start = time.time()
-        while True:
-            try:
-                v = self.sc.active_vessel
-                if v and v.situation.name.lower() in ("pre_launch", "flying"):
-                    return
-            except Exception:
-                pass
-            if time.time() - start > timeout:
-                raise TimeoutError("Timeout waiting for prelaunch state.")
-            time.sleep(poll)
-
-    def _make_streams(self):
-        flight = self.vessel.flight()
-        self.altitude_s = self.conn.add_stream(getattr, flight, "mean_altitude")
-        self.vspeed_s = self.conn.add_stream(getattr, flight, "vertical_speed")
+        # Create streams for performance
+        self.altitude_s = self.conn.add_stream(getattr, flight, 'mean_altitude')
+        self.vspeed_s = self.conn.add_stream(getattr, flight, 'vertical_speed')
+        
         self.fuel_max = max(1.0, self.vessel.resources.max("LiquidFuel"))
         self.fuel_s = self.conn.add_stream(self.vessel.resources.amount, "LiquidFuel")
 
-    def _fuel_frac(self):
+    def _get_obs(self) -> np.ndarray:
+        """Gets the current observation from the kRPC streams."""
         try:
-            return self.fuel_s() / self.fuel_max
-        except Exception:
-            return 0.0
-
-    def _get_obs(self):
-        try:
-            alt = float(self.altitude_s())
-            vspd = float(self.vspeed_s())
-            fuel = self._fuel_frac()
-        except Exception:
-            alt, vspd, fuel = 0, 0, 0
-            self.done = True
-        obs = np.array([alt, vspd, fuel], dtype=np.float32)
+            obs = np.array([
+                self.altitude_s(),
+                self.vspeed_s(),
+                self.fuel_s() / self.fuel_max
+            ], dtype=np.float32)
+        except (krpc.error.RPCError, krpc.error.StreamError):
+            # If stream fails (e.g., vessel destroyed), return a zeroed state
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        
         return np.clip(obs, self.observation_space.low, self.observation_space.high)
 
-    def _check_crash(self):
-        try:
-            if self.altitude_s() <= 1.0:
-                return True
-        except Exception:
-            return True
-        return False
+    def _wait_for_prelaunch(self, timeout: float = 20.0):
+        """Waits for the game to be in a controllable 'pre_launch' state."""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                if self.sc.active_vessel and self.sc.active_vessel.situation.name == 'pre_launch':
+                    return
+            except krpc.error.RPCError:
+                pass # Ignore errors during scene transitions
+            time.sleep(0.5)
+        raise TimeoutError("Timed out waiting for pre-launch state.")
+    
+    # ------------------------
+    # Logging & Rendering
+    # ------------------------
+    def _init_flight_log(self):
+        """Creates the header for the flight log CSV file."""
+        with open(self.flight_log_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "altitude_m", "throttle", "reward"])
+
+    def _log_step(self, altitude: float, throttle: float, reward: float):
+        """Logs a single step to the flight log file."""
+        with open(self.flight_log_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([self.steps, f"{altitude:.2f}", f"{throttle:.3f}", f"{reward:.4f}"])
+
+    def render(self, mode: str = "human"):
+        """Prints the current state of the environment to the console."""
+        obs = self._get_obs()
+        print(
+            f"Step: {self.steps:04d} | "
+            f"Alt: {obs[0]:7.1f}m | "
+            f"V-Spd: {obs[1]:6.1f}m/s | "
+            f"Fuel: {obs[2]:.2f} | "
+            f"Reward: {self.episode_reward:8.2f}"
+        )
+
+    def close(self):
+        """Closes the kRPC connection."""
+        if self.conn:
+            print("Closing kRPC connection.")
+            self.conn.close()
+            self.conn = None
