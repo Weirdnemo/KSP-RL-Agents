@@ -11,3 +11,4 @@ Hover/hover_test.py
 launching/ppo_ksp_altitude.zip
 ppo_ksp_altitude.zip
 Hover/checkpoints
+Hover/training_logs
