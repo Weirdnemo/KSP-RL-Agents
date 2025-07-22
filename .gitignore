@@ -20,3 +20,4 @@ KSP_Landing_Agent/landing_logs
 KSP_Landing_Agent/__pycache__/ksp_landing_env.cpython-310.pyc
 KSP_Landing_Agent/landing_checkpoints
 KSP_Landing_Agent/test_flight_data.csv
+KSP_Landing_Agent/suicide_burn.py
