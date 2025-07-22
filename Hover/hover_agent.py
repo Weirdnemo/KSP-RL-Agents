@@ -1,102 +1,82 @@
 import os
-import time
 import csv
+import time
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from ksp_hover_env import HoverEnv
 
-# Config
-TOTAL_TIMESTEPS = 50_000
-CHECKPOINT_INTERVAL = 2_000
-EVAL_INTERVAL = 10_000
-MODEL_PREFIX = "ppo_hover_agent"
+MODEL_PATH = "ppo_hover_agent"
+LOG_DIR = "training_logs"
+os.makedirs(LOG_DIR, exist_ok=True)
 
-os.makedirs("checkpoints", exist_ok=True)
-os.makedirs("logs", exist_ok=True)
-
-# ---------------------------
-# CSV Logger for Evaluation
-# ---------------------------
-def log_hover_episode(model, steps_done):
-    csv_path = f"logs/hover_log_{steps_done}.csv"
-    env = HoverEnv(step_sleep=0.2)
-    obs, _ = env.reset()
-
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["time_s", "altitude_m", "throttle"])
-        writer.writeheader()
-
-        start = time.time()
-        done = False
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            elapsed = time.time() - start
-            writer.writerow({
-                "time_s": f"{elapsed:.2f}",
-                "altitude_m": f"{obs[0]:.2f}",
-                "throttle": f"{action[0]:.3f}"
-            })
-            done = terminated or truncated
-
-    env.close()
-    print(f"[LOG] Hover episode logged to {csv_path}")
-
-# ---------------------------
-# Custom Callback
-# ---------------------------
-class CheckpointCallback(BaseCallback):
-    def __init__(self, save_freq, eval_freq, verbose=1):
-        super().__init__(verbose)
-        self.save_freq = save_freq
-        self.eval_freq = eval_freq
+# ---------------------------------------------------
+# Callback to Save Model Every 2k and Flight Logs Every 10k
+# ---------------------------------------------------
+class SaveModelAndCSVCallback(BaseCallback):
+    def __init__(self, model_save_freq=2_000, log_save_freq=10_000, log_dir=LOG_DIR, verbose=1):
+        super(SaveModelAndCSVCallback, self).__init__(verbose)
+        self.model_save_freq = model_save_freq
+        self.log_save_freq = log_save_freq
+        self.log_dir = log_dir
+        self.csv_file = None
+        self.csv_writer = None
+        self.current_log_path = None
 
     def _on_step(self) -> bool:
         steps = self.num_timesteps
 
-        # Save checkpoint
-        if steps % self.save_freq == 0:
-            path = f"checkpoints/{MODEL_PREFIX}_{steps}.zip"
-            self.model.save(path)
-            if self.verbose:
-                print(f"[CHECKPOINT] Saved model at {path}")
+        # Save model every 2k steps
+        if steps % self.model_save_freq == 0:
+            model_file = os.path.join(self.log_dir, f"ppo_hover_agent_{steps}.zip")
+            self.model.save(model_file)
+            if self.verbose > 0:
+                print(f"[MODEL] Saved model at {model_file}")
 
-        # Log hover performance
-        if steps % self.eval_freq == 0:
-            log_hover_episode(self.model, steps)
+        # Start a new CSV log every 10k steps
+        if steps % self.log_save_freq == 0:
+            if self.csv_file:
+                self.csv_file.close()
+
+            log_file = os.path.join(self.log_dir, f"hover_log_{steps // 1000}k.csv")
+            self.current_log_path = log_file
+            self.csv_file = open(log_file, "w", newline="")
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(["step", "time_s", "apoapsis_m", "v_speed_mps", "throttle"])
+
+            if self.verbose > 0:
+                print(f"[CSV] Starting log file: {log_file}")
+
+        # Append step data to CSV if logging
+        if self.csv_writer:
+            env = self.training_env.envs[0].env
+            obs = env._get_obs()
+            step_time = time.time() - env.start_time
+            self.csv_writer.writerow([steps, step_time, obs[0], obs[1], env.control.throttle])
 
         return True
 
-# ---------------------------
-# Training
-# ---------------------------
-def train_agent(total_steps=TOTAL_TIMESTEPS):
-    env = HoverEnv(step_sleep=0.2)
-    model = PPO(
-        "MlpPolicy",
-        env,
-        verbose=1,
-        learning_rate=3e-4,
-        n_steps=512,
-        batch_size=64,
-        gamma=0.99,
-        gae_lambda=0.95,
-        ent_coef=0.01,
-        n_epochs=10,
-    )
+    def _on_training_end(self) -> None:
+        if self.csv_file:
+            self.csv_file.close()
+        if self.verbose > 0:
+            print("[INFO] Training finished, final CSV and models saved.")
 
-    callback = CheckpointCallback(
-        save_freq=CHECKPOINT_INTERVAL,
-        eval_freq=EVAL_INTERVAL,
-        verbose=1
-    )
+# ---------------------------------------------------
+# Train Agent
+# ---------------------------------------------------
+def train_agent(total_steps=50_000):
+    env = HoverEnv(step_sleep=0.2, max_steps=500)
+    model = PPO("MlpPolicy", env, verbose=1)
+
+    callback = SaveModelAndCSVCallback(model_save_freq=2_000, log_save_freq=10_000, log_dir=LOG_DIR)
 
     print("[INFO] Starting training...")
     model.learn(total_timesteps=total_steps, callback=callback)
-    model.save(f"{MODEL_PREFIX}_final.zip")
-    print(f"[INFO] Training finished. Final model saved as {MODEL_PREFIX}_final.zip")
+    model.save(MODEL_PATH)
+    print(f"[INFO] Training complete. Final model saved as {MODEL_PATH}.zip")
+
     env.close()
 
 if __name__ == "__main__":
-    train_agent()
+    train_agent(total_steps=50_000)

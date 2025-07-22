@@ -6,11 +6,10 @@ import krpc
 
 class HoverEnv(gym.Env):
     """
-    Hover environment for KSP.
-    Goal: Reach ~500 m altitude and hover as long as possible.
-    - Observations: [altitude, vertical_speed, fuel_frac]
-    - Actions: [throttle] in [0, 1].
-    - Reward: Encourages being near 500 m and keeping vertical_speed near 0.
+    Hover environment for KSP using apoapsis control.
+    Goal: Keep apoapsis near 500 m and maintain low vertical speed (<5 m/s).
+    Observations: [apoapsis, vertical_speed, fuel_frac]
+    Actions: [throttle] in [0, 1].
     """
 
     metadata = {"render.modes": ["human"]}
@@ -34,13 +33,13 @@ class HoverEnv(gym.Env):
             dtype=np.float32
         )
         self.observation_space = gym.spaces.Box(
-            low=np.array([0.0, -200.0, 0.0], dtype=np.float32),
-            high=np.array([1000.0, 200.0, 1.0], dtype=np.float32),
+            low=np.array([0.0, -100.0, 0.0], dtype=np.float32),
+            high=np.array([1000.0, 100.0, 1.0], dtype=np.float32),
             dtype=np.float32
         )
 
         # Streams
-        self.altitude_s = None
+        self.apoapsis_s = None
         self.vspeed_s = None
         self.fuel_s = None
         self.fuel_max = 1.0
@@ -48,7 +47,7 @@ class HoverEnv(gym.Env):
         # Episode state
         self.steps = 0
         self.start_time = 0
-        self.max_altitude = 0.0
+        self.max_apoapsis = 0.0
         self.done = False
 
         # Bind vessel and streams
@@ -63,7 +62,7 @@ class HoverEnv(gym.Env):
         self.done = False
         self.steps = 0
         self.start_time = time.time()
-        self.max_altitude = 0.0
+        self.max_apoapsis = 0.0
 
         try:
             self.sc.revert_to_launch()
@@ -77,6 +76,7 @@ class HoverEnv(gym.Env):
         self._bind_vessel()
         self._make_streams()
 
+        self.control.sas = True
         self.control.throttle = 0.0
         self.control.activate_next_stage()
 
@@ -88,57 +88,45 @@ class HoverEnv(gym.Env):
     # ------------------------
     def step(self, action):
         if self.done:
-            return self._get_obs(), 0.0, True, False, {"max_altitude": self.max_altitude}
+            return self._get_obs(), 0.0, True, False, {"max_apoapsis": self.max_apoapsis}
 
         throttle = float(np.clip(action[0], 0.0, 1.0))
         self.control.throttle = throttle
         time.sleep(self.step_sleep)
 
         obs = self._get_obs()
-        alt, vspd = obs[0], obs[1]
+        apo, vspd = obs[0], obs[1]
 
-        # Update max altitude
-        if alt > self.max_altitude:
-            self.max_altitude = alt
+        # Update max apoapsis
+        if apo > self.max_apoapsis:
+            self.max_apoapsis = apo
 
         # Reward logic
         reward = 0.0
+        apo_error = abs(apo - 500)
+        reward -= apo_error * 0.05  # penalty for being away from 500
 
-        # Strong positive reward near 500 m
-        altitude_error = abs(alt - 500)
-        reward -= altitude_error * 0.05  # penalty for being away from 500
+        if 450 <= apo <= 525:
+            reward += 10.0 - apo_error * 0.1  # strong reward near 500
 
-        # Extra reward for being close to 500
-        if 450 <= alt <= 525:
-            reward += 10.0 - altitude_error * 0.1
-
-        # Penalize vertical speed (we want vspd near 0)
-        reward -= abs(vspd) * 0.05
-
-        # Predictive penalty if going too fast near 400–500 m
-        if 400 < alt < 500:
+        # Vertical speed penalty
+        if apo < 510:  # only damp vertical speed if close
             reward -= abs(vspd) * 0.1
 
-        # Heavy penalty and termination if >600 m
-        if alt > 600:
+        # Termination conditions
+        if apo > 600 or (apo < 350 and self.vspeed_s() < -5):
             reward -= 200.0
             self.done = True
 
-        # Heavy penalty if crashes
-        if self._check_crash():
-            reward -= 200.0
-            self.done = True
-
-        # Time-based termination
         elapsed = time.time() - self.start_time
         if elapsed >= self.episode_time_limit:
             self.done = True
 
         self.steps += 1
         return obs, reward, self.done, False, {
-            "max_altitude": self.max_altitude,
+            "max_apoapsis": self.max_apoapsis,
             "elapsed_time": elapsed,
-            "altitude_error": altitude_error
+            "apo_error": apo_error
         }
 
     # ------------------------
@@ -147,7 +135,7 @@ class HoverEnv(gym.Env):
     def render(self, mode="human"):
         obs = self._get_obs()
         print(
-            f"Step {self.steps} | Alt: {obs[0]:.1f} m | Vspd: {obs[1]:.1f} m/s | Fuel: {obs[2]:.2f} | MaxAlt: {self.max_altitude:.1f} m"
+            f"Step {self.steps} | Apoapsis: {obs[0]:.1f} m | Vspd: {obs[1]:.1f} m/s | Fuel: {obs[2]:.2f} | MaxApo: {self.max_apoapsis:.1f} m"
         )
 
     # ------------------------
@@ -180,8 +168,9 @@ class HoverEnv(gym.Env):
             time.sleep(poll)
 
     def _make_streams(self):
+        orbit = self.vessel.orbit
         flight = self.vessel.flight()
-        self.altitude_s = self.conn.add_stream(getattr, flight, "mean_altitude")
+        self.apoapsis_s = self.conn.add_stream(getattr, orbit, "apoapsis_altitude")
         self.vspeed_s = self.conn.add_stream(getattr, flight, "vertical_speed")
         self.fuel_max = max(1.0, self.vessel.resources.max("LiquidFuel"))
         self.fuel_s = self.conn.add_stream(self.vessel.resources.amount, "LiquidFuel")
@@ -194,19 +183,11 @@ class HoverEnv(gym.Env):
 
     def _get_obs(self):
         try:
-            alt = float(self.altitude_s())
+            apo = float(self.apoapsis_s())
             vspd = float(self.vspeed_s())
             fuel = self._fuel_frac()
         except Exception:
-            alt, vspd, fuel = 0, 0, 0
+            apo, vspd, fuel = 0, 0, 0
             self.done = True
-        obs = np.array([alt, vspd, fuel], dtype=np.float32)
+        obs = np.array([apo, vspd, fuel], dtype=np.float32)
         return np.clip(obs, self.observation_space.low, self.observation_space.high)
-
-    def _check_crash(self):
-        try:
-            if self.altitude_s() <= 1.0:
-                return True
-        except Exception:
-            return True
-        return False
