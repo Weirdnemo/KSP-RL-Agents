@@ -6,14 +6,14 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 
-# Import our new landing environment
+# Import our KSP landing environment
 from ksp_landing_env import LandingEnv
 
 # --- Configuration ---
 LOG_DIR = Path("landing_logs/")
 MODEL_DIR = Path("landing_checkpoints/")
-TOTAL_TIMESTEPS = 50_000
-SAVE_INTERVAL = 5_000      # Save a model checkpoint every N steps
+TOTAL_TIMESTEPS = 100_000
+SAVE_INTERVAL = 5_000       # Save a model checkpoint every N steps
 LOG_ARCHIVE_INTERVAL = 25_000 # Archive the CSV flight log every N steps
 EPISODIC_LOG_INTERVAL = 5_000 # Enable detailed logging for one episode every N steps
 
@@ -36,6 +36,7 @@ def find_latest_checkpoint(model_dir: Path) -> Optional[Path]:
         checkpoints = list(model_dir.glob("landing_agent_*.zip"))
         if not checkpoints:
             return None
+        # Find the checkpoint with the highest number of steps in its filename
         return max(checkpoints, key=lambda p: int(p.stem.split('_')[-1]))
     except (ValueError, IndexError):
         return None
@@ -54,23 +55,33 @@ class CustomCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         # --- Save model checkpoint ---
-        if self.num_timesteps > 0 and self.num_timesteps % self.save_freq == 0:
+        if self.num_timesteps % self.save_freq == 0:
             path = self.save_path / f"landing_agent_{self.num_timesteps}.zip"
             self.model.save(path)
             if self.verbose > 0:
                 print(f"💾 Saved model checkpoint to {path}")
         
         # --- Archive the main flight log CSV ---
-        if self.num_timesteps > 0 and self.num_timesteps % self.log_archive_freq == 0:
+        if self.num_timesteps % self.log_archive_freq == 0:
             self.training_env.env_method("archive_log_file", self.num_timesteps)
         
-        # --- Enable detailed logging for one full episode ---
+        # --- Manage episodic logging ---
+        underlying_env = self.training_env.envs[0]
+
+        # FIX: After an episode where logging was on, turn it off.
+        # `dones` is a flag indicating if the episode just ended.
+        if self.locals['dones'][0] and underlying_env.logging_enabled:
+            if self.verbose > 0:
+                print("📝 Disabling detailed logging for the next episode.")
+            underlying_env.disable_logging()
+
+        # Enable detailed logging for one full episode at the specified interval
         if self.num_timesteps - self.last_log_enable_step >= self.episodic_log_freq:
-            underlying_env = self.training_env.envs[0]
             if not underlying_env.logging_enabled:
-                 print(f"📝 Enabling detailed logging for the next episode (Timestep: {self.num_timesteps})")
-                 underlying_env.enable_logging()
-                 self.last_log_enable_step = self.num_timesteps
+                if self.verbose > 0:
+                    print(f"📝 Enabling detailed logging for the next episode (Timestep: {self.num_timesteps})")
+                underlying_env.enable_logging()
+                self.last_log_enable_step = self.num_timesteps
 
         return True
     
@@ -83,7 +94,7 @@ def train_agent():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     
-    # Wrap the environment with VecMonitor to automatically log rewards and episode lengths to TensorBoard
+    # Wrap the environment with VecMonitor to automatically log rewards to TensorBoard
     env = VecMonitor(DummyVecEnv([lambda: LandingEnv()]), str(LOG_DIR))
 
     model: PPO
@@ -91,8 +102,8 @@ def train_agent():
 
     if latest_checkpoint:
         print(f"✅ Resuming training from checkpoint: {latest_checkpoint}")
+        # When loading, SB3 automatically handles continuing the timestep count
         model = PPO.load(latest_checkpoint, env=env, tensorboard_log=str(LOG_DIR))
-        # The number of timesteps is automatically handled by SB3 when loading a model
     else:
         print("🚀 Starting a new training run.")
         model = PPO(env=env, verbose=1, tensorboard_log=str(LOG_DIR), **PPO_KWARGS)
@@ -105,7 +116,7 @@ def train_agent():
     )
 
     try:
-        # Note: 'reset_num_timesteps=False' ensures timesteps continue from the loaded model
+        # `reset_num_timesteps=False` is crucial for resuming training correctly
         model.learn(
             total_timesteps=TOTAL_TIMESTEPS,
             callback=callback,
@@ -115,8 +126,8 @@ def train_agent():
     except KeyboardInterrupt:
         print("\n🛑 Training interrupted by user.")
     finally:
-        # Save the final model
-        final_model_path = MODEL_DIR / f"landing_agent_final_{model.num_timesteps}.zip"
+        # Save the final model using the same naming convention for easy resume
+        final_model_path = MODEL_DIR / f"landing_agent_{model.num_timesteps}.zip"
         model.save(final_model_path)
         print(f"💾 Final model saved at: {final_model_path}")
         env.close()
