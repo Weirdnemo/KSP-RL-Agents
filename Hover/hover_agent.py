@@ -27,14 +27,6 @@ class SaveModelAndCSVCallback(BaseCallback):
         # Episode stats
         self.episode_reward = 0.0
         self.episode_steps = 0
-        self.episode_start_time = 0
-        self.max_apoapsis = 0.0
-        self.vertical_speeds = []
-
-    def _on_rollout_start(self) -> None:
-        """Called at the start of each rollout (approx. each episode)."""
-        self.episode_reward = 0.0
-        self.episode_steps = 0
         self.episode_start_time = time.time()
         self.max_apoapsis = 0.0
         self.vertical_speeds = []
@@ -53,7 +45,6 @@ class SaveModelAndCSVCallback(BaseCallback):
         if steps % self.log_save_freq == 0:
             if self.csv_file:
                 self.csv_file.close()
-
             log_file = os.path.join(self.log_dir, f"hover_log_{steps // 1000}k.csv")
             self.current_log_path = log_file
             self.csv_file = open(log_file, "w", newline="")
@@ -62,7 +53,7 @@ class SaveModelAndCSVCallback(BaseCallback):
             if self.verbose > 0:
                 print(f"[CSV] Starting log file: {log_file}")
 
-        # Append step data to CSV if logging
+        # Log step data
         if self.csv_writer:
             env = self.training_env.envs[0].env
             obs = env._get_obs()
@@ -77,19 +68,27 @@ class SaveModelAndCSVCallback(BaseCallback):
         self.vertical_speeds.append(obs[1])
         self.max_apoapsis = max(self.max_apoapsis, obs[0])
 
-        return True
+        # Check if episode ended
+        done = bool(self.locals.get("dones", [False])[0])
+        if done:
+            avg_v_speed = np.mean(self.vertical_speeds) if self.vertical_speeds else 0.0
+            ep_time = time.time() - self.episode_start_time
+            print(
+                f"[EP DONE] Steps={self.episode_steps}, "
+                f"Reward={self.episode_reward:.2f}, "
+                f"Max Apoapsis={self.max_apoapsis:.1f}m, "
+                f"Avg VSpeed={avg_v_speed:.2f} m/s, "
+                f"Time={ep_time:.1f}s"
+            )
 
-    def _on_rollout_end(self) -> None:
-        """Print episode summary when the rollout (episode) ends."""
-        avg_v_speed = np.mean(self.vertical_speeds) if self.vertical_speeds else 0.0
-        ep_time = time.time() - self.episode_start_time
-        print(
-            f"[EPISODE DONE] Steps={self.episode_steps}, "
-            f"Reward={self.episode_reward:.2f}, "
-            f"Max Apoapsis={self.max_apoapsis:.1f}m, "
-            f"Avg VSpeed={avg_v_speed:.2f} m/s, "
-            f"Time={ep_time:.1f}s"
-        )
+            # Reset episode stats
+            self.episode_reward = 0.0
+            self.episode_steps = 0
+            self.episode_start_time = time.time()
+            self.max_apoapsis = 0.0
+            self.vertical_speeds = []
+
+        return True
 
     def _on_training_end(self) -> None:
         if self.csv_file:
