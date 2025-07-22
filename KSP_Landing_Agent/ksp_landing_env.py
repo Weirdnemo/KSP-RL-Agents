@@ -1,7 +1,8 @@
-import time, numpy as np, gymnasium as gym, krpc
+import time, numpy as np, gymnasium as gym, krpc, csv
 from typing import Tuple, Dict, Any
+from pathlib import Path
 
-class LandingEnv(gym.env):
+class LandingEnv(gym.Env):
     metadata = {'render.modes': ['human']}
 
     #---Configuration Constants---#
@@ -11,6 +12,7 @@ class LandingEnv(gym.env):
     MAX_LANDING_ANGLE = 5.0 #MAX degrees of deviation from vertical.
 
     #---Reward Constants---#
+    PENALTY_POSITIVE_VSPEED = -0.8
     REWARD_SUCCESS = 200.0
     PENALTY_CRASH_MULTIPLIER = 10.0
     PENALTY_FUEL_PER_THROTTLE = -0.05
@@ -19,7 +21,10 @@ class LandingEnv(gym.env):
     def __init__(self, step_sleep: float = 0.2):
         super().__init__()
         self.step_sleep = step_sleep
-
+        self.log_dir = Path("landing_logs") # Add this
+        self.log_dir.mkdir(parents=True, exist_ok=True) # Add this
+        self.flight_log_file = self.log_dir / "landing_flight_log.csv" # Add this
+        
         #---Action Space---#
         self.action_space = gym.spaces.Box(
             low=np.array([0.0]),
@@ -87,7 +92,7 @@ class LandingEnv(gym.env):
             time.sleep(0.5)
         raise TimeoutError("Timed out waiting for a controllable vessel.")
     
-def _bind_vessel_and_streams(self):
+    def _bind_vessel_and_streams(self):
         """Binds to the active vessel and creates kRPC data streams."""
         self.vessel = self.sc.active_vessel
         # Use a reference frame that follows the vessel's orientation
@@ -102,22 +107,22 @@ def _bind_vessel_and_streams(self):
         self.fuel_max = max(1.0, self.vessel.resources.max("LiquidFuel"))
         self.fuel_s = self.conn.add_stream(self.vessel.resources.amount, "LiquidFuel")
 
-def _get_obs(self) -> np.ndarray:
-    """Gets the current observation from the kRPC streams."""
-    try:
-        obs = np.array([
-            self.alt_s(),
-            self.vspeed_s(),
-            self.hspeed_s(),
-            self.fuel_s() / self.fuel_max
-        ], dtype=np.float32)
-    except (krpc.error.RPCError, krpc.error.StreamError):
-        # If stream fails, return a zeroed state
-        obs = np.zeros(self.observation_space.shape, dtype=np.float32)
-    
-    return np.clip(obs, self.observation_space.low, self.observation_space.high)
+    def _get_obs(self) -> np.ndarray:
+        """Gets the current observation from the kRPC streams."""
+        try:
+            obs = np.array([
+                self.alt_s(),
+                self.vspeed_s(),
+                self.hspeed_s(),
+                self.fuel_s() / self.fuel_max
+            ], dtype=np.float32)
+        except (krpc.error.RPCError, krpc.error.StreamError):
+            # If stream fails, return a zeroed state
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
 
-def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        return np.clip(obs, self.observation_space.low, self.observation_space.high)
+
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """Advance the environment by one time step."""
         throttle = float(np.clip(action[0], 0, 1))
         try:
@@ -132,60 +137,110 @@ def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[
         terminated = self._check_termination()
         reward = self._compute_reward(obs, throttle, terminated)
         self.episode_reward += reward
-
+        self._log_step(obs, throttle, reward)
         truncated = (time.time() - self.start_time) >= self.EPISODE_TIME_LIMIT
         self.steps += 1
 
         return obs, reward, terminated, truncated, {}
 
-def _compute_reward(self, obs: np.ndarray, throttle: float, terminated: bool) -> float:
-    """Calculates the reward for the current state."""
-    _, v_speed, h_speed, _ = obs
-# The new version in _compute_reward()
-    if terminated:
-        # Get final orientation and speed
-        final_pitch = self.pitch_s()
-        impact_speed = np.sqrt(v_speed**2 + h_speed**2)
-    
-        # Check if the vessel is upright
-        is_upright = abs(final_pitch - 90.0) < self.MAX_LANDING_ANGLE
-    
-        # A successful landing must be BOTH slow and upright
-        if impact_speed < self.MAX_IMPACT_VELOCITY and is_upright:
-            print(f"✅ SUCCESSFUL LANDING! Speed: {impact_speed:.2f} m/s, Angle: {90 - final_pitch:.1f}° off vertical")
-            return self.REWARD_SUCCESS
+    def _compute_reward(self, obs: np.ndarray, throttle: float, terminated: bool) -> float:
+        """Calculates the reward for the current state."""
+        _, v_speed, h_speed, _ = obs
+
+        if terminated:
+            # --- TERMINAL REWARD (ONCE, AT THE END) ---
+            # Get final orientation and speed
+            final_pitch = self.pitch_s()
+            impact_speed = np.sqrt(v_speed**2 + h_speed**2)
+
+            # Check if the vessel is upright
+            is_upright = abs(final_pitch - 90.0) < self.MAX_LANDING_ANGLE
+
+            # A successful landing must be BOTH slow and upright
+            if impact_speed < self.MAX_IMPACT_VELOCITY and is_upright:
+                print(f"✅ SUCCESSFUL LANDING! Speed: {impact_speed:.2f} m/s, Angle: {abs(90 - final_pitch):.1f}° off vertical")
+                return self.REWARD_SUCCESS
+            else:
+                # If either condition fails, it's a crash
+                reason = "fast impact" if impact_speed >= self.MAX_IMPACT_VELOCITY else "tipped over"
+                print(f"💥 Crash! Reason: {reason}. Speed: {impact_speed:.2f} m/s, Angle: {abs(90 - final_pitch):.1f}° off vertical")
+                tip_penalty = 50 if not is_upright else 0
+                return -self.PENALTY_CRASH_MULTIPLIER * impact_speed - tip_penalty
+        
         else:
-            # If either condition fails, it's a crash
-            reason = "fast impact" if not impact_speed < self.MAX_IMPACT_VELOCITY else "tipped over"
-            print(f"💥 Crash! Reason: {reason}. Speed: {impact_speed:.2f} m/s, Angle: {90 - final_pitch:.1f}° off vertical")
-            # Add an extra penalty if it tipped over
-            tip_penalty = 50 if not is_upright else 0
-            return -self.PENALTY_CRASH_MULTIPLIER * impact_speed - tip_penalty
+            # --- SHAPING REWARD (EVERY STEP WHILE IN-AIR) ---
+            
+            # 1. Penalty for moving upwards to prevent bouncing
+            upward_speed_penalty = 0
+            if v_speed > 0:
+                upward_speed_penalty = self.PENALTY_POSITIVE_VSPEED * v_speed
+            
+            # 2. Combine with penalties for time and fuel
+            shaping_reward = self.PENALTY_TIME + \
+                             (self.PENALTY_FUEL_PER_THROTTLE * throttle) + \
+                             upward_speed_penalty
+                             
+            return shaping_reward
     
-    # While in-air, give small penalties to encourage efficiency
-    shaping_reward = self.PENALTY_TIME + (self.PENALTY_FUEL_PER_THROTTLE * throttle)
-    return shaping_reward
-def _check_termination(self) -> bool:
-    """Checks if the vessel has landed, splashed, or crashed."""
-    try:
-        situation = self.vessel.situation
-        # 'pre_launch' is what a crash on land often registers as
-        return situation.name in ['landed', 'splashed', 'pre_launch']
-    except krpc.error.RPCError:
-        return True
-def render(self, mode: str = "human"):
-    """Prints the current state of the environment to the console."""
-    obs = self._get_obs()
-    print(
-        f"Step: {self.steps:03d} | "
-        f"Alt: {obs[0]:6.1f}m | "
-        f"VSpd: {obs[1]:6.1f}m/s | "
-        f"HSpd: {obs[2]:6.1f}m/s | "
-        f"Fuel: {obs[3]:.2f}"
-    )
-def close(self):
-    """Closes the kRPC connection."""
-    if self.conn:
-        print("Closing kRPC connection.")
-        self.conn.close()
-        self.conn = None
+# In ksp_landing_env.py, inside the LandingEnv class
+
+    def _init_flight_log(self):
+        """Creates the header for the flight log CSV file."""
+        with open(self.flight_log_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "altitude_m", "v_speed", "h_speed", "throttle", "reward"])
+
+    def _log_step(self, obs: np.ndarray, throttle: float, reward: float):
+        """Logs a single step to the flight log file."""
+        with open(self.flight_log_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            # Unpack observation for logging
+            altitude, v_speed, h_speed, _ = obs
+            writer.writerow([self.steps, f"{altitude:.2f}", f"{v_speed:.2f}", f"{h_speed:.2f}", f"{throttle:.3f}", f"{reward:.4f}"])
+
+    def archive_log_file(self, archive_step_count: int):
+        """Renames the current flight log to an archive and starts a new one."""
+        if self.flight_log_file.exists() and self.flight_log_file.stat().st_size > 0:
+            archive_name = self.flight_log_file.with_name(
+                f"landing_flight_log_steps_{archive_step_count}.csv"
+            )
+            self.flight_log_file.replace(archive_name)
+            print(f"🗄️  Archived flight log to {archive_name}")
+            self._init_flight_log()
+
+    def _check_termination(self) -> bool:
+        """Checks if the vessel has landed, crashed, or lost control."""
+        try:
+            situation = self.vessel.situation
+            # Check if the vessel has touched down
+            if situation.name in ['landed', 'splashed', 'pre_launch']:
+                return True
+
+            # NEW: Check if the controlling part (command pod) has been destroyed
+            if self.vessel.parts.controlling is None:
+                print("🛑 Control lost! Vessel likely destroyed.")
+                return True
+
+        except krpc.error.RPCError:
+            # An RPC error likely means the vessel no longer exists
+            return True
+
+        return False
+        
+    def render(self, mode: str = "human"):
+        """Prints the current state of the environment to the console."""
+        obs = self._get_obs()
+        print(
+            f"Step: {self.steps:03d} | "
+            f"Alt: {obs[0]:6.1f}m | "
+            f"VSpd: {obs[1]:6.1f}m/s | "
+            f"HSpd: {obs[2]:6.1f}m/s | "
+            f"Fuel: {obs[3]:.2f}"
+        )
+
+    def close(self):
+        """Closes the kRPC connection."""
+        if self.conn:
+            print("Closing kRPC connection.")
+            self.conn.close()
+            self.conn = None

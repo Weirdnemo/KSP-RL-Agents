@@ -12,5 +12,10 @@ launching/ppo_ksp_altitude.zip
 ppo_ksp_altitude.zip
 Hover/checkpoints
 Hover/training_logs
-Hover/logs/hover_flight_log.csv
-Hover/logs/hover_flight_log_steps_2921.csv
+Hover/logs
+
+
+
+KSP_Landing_Agent/landing_logs
+KSP_Landing_Agent/__pycache__/ksp_landing_env.cpython-310.pyc
+KSP_Landing_Agent/landing_checkpoints
