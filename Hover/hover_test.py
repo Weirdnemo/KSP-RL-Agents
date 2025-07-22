@@ -7,10 +7,9 @@ from ksp_hover_env import HoverEnv
 
 # --- Configuration ---
 # Make sure this path points to your trained agent .zip file
-MODEL_PATH = Path("checkpoints/ppo_hover_agent_final.zip") 
+MODEL_PATH = Path("D:/reinforce/KSP/Hover/checkpoints/ppo_hover_agent_final_2921.zip")
 # The name of the file where flight data will be saved
 OUTPUT_DATA_FILE = Path("flight_data.csv")
-
 
 def test_and_record():
     """Loads a trained PPO agent, runs one episode, and records the data."""
