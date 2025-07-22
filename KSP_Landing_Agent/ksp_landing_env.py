@@ -17,7 +17,7 @@ class LandingEnv(gym.Env):
     #---Configuration Constants---#
     MAX_IMPACT_VELOCITY = 4.0 #m/s
     MAX_SPEED_LIMIT = 200.0 #m/s
-    EPISODE_TIME_LIMIT = 60.0 #seconds
+    EPISODE_TIME_LIMIT = 120.0 #seconds
     MAX_LANDING_ANGLE = 5.0 #MAX degrees of deviation from vertical.
 
     #---Reward Constants---#
