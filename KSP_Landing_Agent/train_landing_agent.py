@@ -26,7 +26,7 @@ PPO_KWARGS = {
     "n_epochs": 10,
     "gamma": 0.99,
     "gae_lambda": 0.95,
-    "ent_coef": 0.01,
+    "ent_coef": 0.02,
     "policy_kwargs": dict(net_arch=dict(pi=[128, 128], vf=[128, 128])) # Deeper network
 }
 

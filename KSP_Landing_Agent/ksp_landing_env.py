@@ -155,87 +155,63 @@ class LandingEnv(gym.Env):
         return obs, reward, terminated, truncated, {}
 
     def _compute_reward(self, obs: np.ndarray, throttle: float, terminated: bool) -> float:
-        """
-        Calculates a dense reward for the current state to guide the agent.
-        """
-        # --- Unpack observations for clarity ---
-        altitude, v_speed, h_speed, _ = obs
+            """
+            Calculates a dense reward for the current state to guide the agent.
+            """
+            # --- Unpack observations for clarity ---
+            altitude, v_speed, h_speed, _ = obs
 
-        # --- Terminal Rewards (End of Episode) ---
-        if terminated:
-            # Get final state information
-            try:
-                final_pitch = self.pitch_s()
-                situation = self.vessel.situation.name
-                is_destroyed = self.vessel.parts.controlling is None
-            except krpc.error.RPCError:
-                # This happens if the vessel is completely gone
-                final_pitch = 0 
-                situation = "destroyed"
-                is_destroyed = True
+            # --- Terminal Rewards (End of Episode) ---
+            if terminated:
+                # (Your existing terminal reward logic is excellent and does not need to be changed)
+                try:
+                    final_pitch = self.pitch_s()
+                    situation = self.vessel.situation.name
+                    is_destroyed = self.vessel.parts.controlling is None
+                except krpc.error.RPCError:
+                    final_pitch, situation, is_destroyed = 0, "destroyed", True
 
-            # Case 1: Vessel is destroyed or has lost control
-            if is_destroyed or situation not in ['landed', 'splashed', 'pre_launch']:
-                print(f"💥 Crash! Vessel lost.")
-                return -200.0 # Large, fixed penalty for destruction
+                if is_destroyed or situation not in ['landed', 'splashed', 'pre_launch']:
+                    return -200.0
 
-            # Case 2: Vessel has landed or splashed down
-            impact_speed = np.sqrt(v_speed**2 + h_speed**2)
-            angle_off_vertical = abs(final_pitch - 90.0)
-            is_upright = angle_off_vertical < self.MAX_LANDING_ANGLE
-            is_soft_impact = impact_speed < self.MAX_IMPACT_VELOCITY
+                impact_speed = np.sqrt(v_speed**2 + h_speed**2)
+                angle_off_vertical = abs(final_pitch - 90.0)
+                is_upright = angle_off_vertical < self.MAX_LANDING_ANGLE
+                is_soft_impact = impact_speed < self.MAX_IMPACT_VELOCITY
 
-            # Successful Landing (soft and upright)
-            if is_soft_impact and is_upright:
-                print(f"✅ SUCCESSFUL LANDING! Speed: {impact_speed:.2f} m/s, Angle: {angle_off_vertical:.1f}°")
-                
-                # Start with a base success reward
-                reward = self.REWARD_SUCCESS # +200
+                if is_soft_impact and is_upright:
+                    reward = self.REWARD_SUCCESS
+                    reward += 50.0 * (1 - (impact_speed / self.MAX_IMPACT_VELOCITY))
+                    reward += 50.0 * (1 - (angle_off_vertical / self.MAX_LANDING_ANGLE))
+                    return reward
+                else:
+                    return -100 - (impact_speed * 10)
 
-                # Add a bonus for how slow the impact was (max +50)
-                # The closer to 0 m/s, the higher the bonus
-                velocity_bonus = 50.0 * (1 - (impact_speed / self.MAX_IMPACT_VELOCITY))
-                reward += velocity_bonus
-
-                # Add a bonus for how upright the landing was (max +50)
-                # The closer to 0 degrees off vertical, the higher the bonus
-                angle_bonus = 50.0 * (1 - (angle_off_vertical / self.MAX_LANDING_ANGLE))
-                reward += angle_bonus
-                
-                return reward
-            
-            # Failed Landing (hard impact or tipped over)
+            # --- Shaping Rewards (During Flight) ---
             else:
-                reason = []
-                if not is_soft_impact: reason.append("fast impact")
-                if not is_upright: reason.append("tipped over")
-                print(f"💥 Failed Landing! Reason: {', '.join(reason)}. Speed: {impact_speed:.2f} m/s, Angle: {angle_off_vertical:.1f}°")
-                
-                # Penalty scales with how hard the crash was
-                penalty = 100 + (impact_speed * 10)
-                return -penalty
+                # 1. Heavily penalize moving upwards. This is the most direct fix.
+                upward_penalty = 0
+                if v_speed > 0:
+                    # The penalty increases exponentially the faster it goes up
+                    upward_penalty = - (v_speed ** 2) * 0.1 
 
-        # --- Shaping Rewards (During Flight) ---
-        else:
-            # 1. Encourage slowing down as altitude decreases.
-            # This is a key heuristic for landing: the lower you are, the slower you should be.
-            # We define a "safe" vertical speed based on altitude.
-            safe_v_speed_target = -max(1.0, altitude / 20.0) # Target speed gets slower closer to the ground
-            
-            # Reward is higher when actual v_speed is close to the safe target speed
-            speed_error = abs(v_speed - safe_v_speed_target)
-            # Use an exponential to reward being very close to the target speed
-            speed_reward = 0.5 * np.exp(-0.1 * speed_error)
+                # 2. Stronger guidance to follow a safe descent profile.
+                safe_v_speed_target = -max(1.0, altitude / 15.0) # Slightly more aggressive descent
+                speed_error = abs(v_speed - safe_v_speed_target)
 
-            # 2. Penalize horizontal speed to encourage vertical descent
-            h_speed_penalty = -abs(h_speed) * 0.01
+                # Reward is higher when close to the target speed, but the penalty for being far is now larger.
+                speed_reward = 1.0 - min(speed_error / 50.0, 1.0) # Linear reward from 0 to 1
 
-            # 3. Penalize fuel usage and time
-            fuel_penalty = self.PENALTY_FUEL_PER_THROTTLE * throttle
-            time_penalty = self.PENALTY_TIME
+                # 3. Penalize horizontal speed to encourage vertical descent
+                h_speed_penalty = -abs(h_speed) * 0.02
 
-            return speed_reward + h_speed_penalty + fuel_penalty + time_penalty
-    
+                # 4. Standard penalties for fuel and time
+                fuel_penalty = self.PENALTY_FUEL_PER_THROTTLE * throttle
+                time_penalty = self.PENALTY_TIME
+
+                return upward_penalty + speed_reward + h_speed_penalty + fuel_penalty + time_penalty
+
+
     def _init_flight_log(self):
         """Creates the header for the flight log CSV file."""
         with open(self.flight_log_file, "w", newline="") as f:
