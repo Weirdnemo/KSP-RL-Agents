@@ -9,17 +9,18 @@ from pathlib import Path
 class LandingEnv(gym.Env):
     """
     An RL environment for landing a rocket in KSP.
-    Goal: Perform a soft, fuel-efficient landing from a starting altitude.
+    Goal: Pass through a 10m 'gate' with low vertical speed.
     """
     metadata = {'render_modes': ['human']}
 
     #--- Configuration Constants ---
-    MAX_IMPACT_VELOCITY = 10.0 # m/s (Vertical speed at leg contact)
+    MAX_GATE_VELOCITY = 10.0   # m/s (Vertical speed at the 10m gate)
+    MAX_UPWARD_SPEED = 5.0     # m/s, exceeding this terminates the episode
     MAX_SPEED_LIMIT = 200.0    # m/s, used for observation space clipping
     EPISODE_TIME_LIMIT = 120.0 # seconds
 
     #--- Reward Constants ---
-    REWARD_SUCCESS = 200.0
+    REWARD_SUCCESS_GATE = 200.0
 
     def __init__(self, step_sleep: float = 0.2):
         super().__init__()
@@ -41,8 +42,8 @@ class LandingEnv(gym.Env):
         #--- kRPC Connection ---
         self.conn = None
         self.vessel = None
-        self.legs = [] # Will hold the vessel's landing legs
-        self.has_touched_down = False # This will latch to True on first contact
+        self.engines = []
+        self.gate_passed = False # This will latch to True on passing the 10m gate
         
         #--- Logging Control ---
         self.logging_enabled = False
@@ -83,8 +84,8 @@ class LandingEnv(gym.Env):
         self.episode_reward = 0.0
         self.start_time = time.time()
         self.prev_altitude = None
-        self.legs = []
-        self.has_touched_down = False # Reset the latch for the new episode
+        self.engines = []
+        self.gate_passed = False # Reset the gate flag for the new episode
 
     def _wait_for_vessel(self, timeout: float = 30.0):
         """Waits for the game to be in a controllable state after loading."""
@@ -101,7 +102,7 @@ class LandingEnv(gym.Env):
     def _bind_vessel_and_streams(self):
         """Binds to the active vessel and creates kRPC data streams."""
         self.vessel = self.sc.active_vessel
-        self.legs = self.vessel.parts.legs # Get all landing leg parts
+        self.engines = self.vessel.parts.engines
         ref_frame = self.vessel.orbit.body.reference_frame
         flight = self.vessel.flight(ref_frame)
 
@@ -122,50 +123,23 @@ class LandingEnv(gym.Env):
             obs = np.zeros(self.observation_space.shape, dtype=np.float32)
         return np.clip(obs, self.observation_space.low, self.observation_space.high)
 
-    def _check_leg_contact(self) -> bool:
-        """Checks if any landing leg is in contact with the ground."""
-        try:
-            for leg in self.legs:
-                if leg.is_grounded:
-                    return True
-        except krpc.error.RPCError:
-            return False # This can happen if the vessel is destroyed
-        return False
-
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """Advances the environment by one time step."""
-        
-        # --- Engine Cutoff Logic ---
-        # First, check if we have already made contact.
-        if self.has_touched_down:
-            # If so, ensure throttle remains zero, regardless of bouncing.
-            throttle = 0.0
-            try:
-                if self.vessel.control.throttle > 0:
-                    self.vessel.control.throttle = 0
-            except krpc.error.RPCError:
-                pass # Vessel might be destroyed, which is fine.
-        else:
-            # If we haven't touched down yet, check for first contact.
-            if self._check_leg_contact():
-                self.has_touched_down = True # Latch the state to True
-                print("🦵 Leg contact! Cutting throttle permanently for this episode.")
-                throttle = 0.0
-                try:
-                    self.vessel.control.throttle = 0
-                except krpc.error.RPCError:
-                    pass
-            else:
-                # If no contact yet, use the agent's action.
-                throttle = float(np.clip(action[0], 0, 1))
-                try:
-                    self.vessel.control.throttle = throttle
-                except krpc.error.RPCError:
-                    return self._get_obs(), -200.0, True, False, {}
+        throttle = float(np.clip(action[0], 0, 1))
+        try:
+            self.vessel.control.throttle = throttle
+        except krpc.error.RPCError:
+            return self._get_obs(), -200.0, True, False, {}
 
         time.sleep(self.step_sleep)
         obs = self._get_obs()
         
+        # NEW: Check for excessive upward velocity
+        if obs[1] > self.MAX_UPWARD_SPEED:
+            print(f"🚀 Excessive upward velocity! Terminating. V-Speed: {obs[1]:.2f} m/s")
+            # Return a large penalty and terminate the episode immediately
+            return obs, -150.0, True, False, {}
+
         terminated = self._check_termination(obs)
         truncated = (time.time() - self.start_time) >= self.EPISODE_TIME_LIMIT
         reward = self._compute_reward(obs, throttle, terminated, truncated)
@@ -177,60 +151,64 @@ class LandingEnv(gym.Env):
         return obs, reward, terminated, truncated, {}
 
     def _compute_reward(self, obs: np.ndarray, throttle: float, terminated: bool, truncated: bool) -> float:
-        """Calculates a direct reward signal for landing behavior."""
+        """Calculates reward based on performance at the 10m gate."""
+        
         if truncated:
             print("⏰ Episode timed out. Applying penalty.")
             return -100.0
-
         if terminated:
             try:
-                v_speed = obs[1]
-                is_soft_impact = abs(v_speed) < self.MAX_IMPACT_VELOCITY
-                is_destroyed = self.vessel.parts.controlling is None
-
-                if is_destroyed:
-                    print("💥 Crash! Vessel destroyed.")
-                    return -200.0
-                
-                if is_soft_impact:
-                    # Proportional reward: better reward for slower landings
-                    proportional_reward = self.REWARD_SUCCESS * (1 - (abs(v_speed) / self.MAX_IMPACT_VELOCITY))
-                    print(f"✅ SUCCESSFUL LANDING! V-Speed: {abs(v_speed):.2f} m/s. Reward: {proportional_reward:.2f}")
-                    return proportional_reward
-                else:
-                    print(f"💥 Failed Landing. V-Speed: {abs(v_speed):.2f} m/s")
-                    return -100.0
+                if self.vessel.parts.controlling is None:
+                    print("💥 Crash! Vessel destroyed after gate.")
+                    return -50.0
             except krpc.error.RPCError:
-                 print(f"💥 Crash! Vessel connection lost.")
-                 return -200.0
+                return -50.0
+            return 0
 
-        # --- Shaping Rewards (During Flight) ---
         altitude = obs[0]
-        altitude_reward = (self.prev_altitude - altitude) * 0.1
-        self.prev_altitude = altitude
         
-        v_speed, h_speed = obs[1], obs[2]
-        total_speed = np.sqrt(v_speed**2 + h_speed**2)
-        velocity_penalty = - (total_speed / self.MAX_SPEED_LIMIT) * 0.5
-        
-        proximity_bonus = np.exp(-0.01 * altitude) * 0.2
+        if self.gate_passed:
+            return -throttle * 0.5
 
-        return altitude_reward + velocity_penalty + proximity_bonus
+        if altitude <= 10.0:
+            self.gate_passed = True
+            print("--- 10m GATE ---")
+            v_speed = obs[1]
+            is_soft_approach = abs(v_speed) < self.MAX_GATE_VELOCITY
+            
+            if is_soft_approach:
+                reward = self.REWARD_SUCCESS_GATE * (1 - (abs(v_speed) / self.MAX_GATE_VELOCITY))
+                print(f"✅ GOOD APPROACH! V-Speed: {abs(v_speed):.2f} m/s. Reward: {reward:.2f}")
+                return reward
+            else:
+                print(f"💥 BAD APPROACH! V-Speed: {abs(v_speed):.2f} m/s")
+                return -100.0
+        else:
+            altitude_reward = (self.prev_altitude - altitude) * 0.1
+            self.prev_altitude = altitude
+            
+            v_speed, h_speed = obs[1], obs[2]
+            total_speed = np.sqrt(v_speed**2 + h_speed**2)
+            velocity_penalty = - (total_speed / self.MAX_SPEED_LIMIT) * 0.5
+            
+            proximity_bonus = np.exp(-0.01 * altitude) * 0.2
+
+            return altitude_reward + velocity_penalty + proximity_bonus
     
     def _check_termination(self, obs: np.ndarray) -> bool:
-        """More robust check for termination conditions."""
-        if self.has_touched_down: # If we have latched the touchdown state, the episode is over.
-            return True
-        if obs[0] <= 0.1: # Fallback check for general ground contact
+        """Termination is now only ground contact or vessel destruction."""
+        if obs[0] <= 0.1:
             return True
 
         try:
-            # Secondary checks for landed state or loss of control
             if self.vessel.parts.controlling is None:
                 print("🛑 Control lost! Vessel likely destroyed.")
                 return True
+            for engine in self.engines:
+                if engine.part is None:
+                    pass
         except krpc.error.RPCError:
-            # If we lose connection to the vessel, it's terminated
+            print("🔥 Engine or critical part destroyed!")
             return True
         return False
         
