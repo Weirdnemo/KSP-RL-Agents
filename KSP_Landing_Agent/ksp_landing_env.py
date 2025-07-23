@@ -11,7 +11,6 @@ class LandingEnv(gym.Env):
     An RL environment for landing a rocket in KSP.
     Goal: Perform a soft, fuel-efficient landing from a starting altitude.
     """
-    # Corrected metadata key from 'render.modes' to 'render_modes'
     metadata = {'render_modes': ['human']}
 
     #---Configuration Constants---#
@@ -21,12 +20,8 @@ class LandingEnv(gym.Env):
     MAX_LANDING_ANGLE = 5.0 #MAX degrees of deviation from vertical.
 
     #---Reward Constants---#
-    PENALTY_POSITIVE_VSPEED = -0.8
     REWARD_SUCCESS = 200.0
-    PENALTY_CRASH_MULTIPLIER = 10.0
-    PENALTY_FUEL_PER_THROTTLE = -0.05
-    PENALTY_TIME = -0.1
-
+    
     def __init__(self, step_sleep: float = 0.2):
         super().__init__()
         self.step_sleep = step_sleep
@@ -53,9 +48,7 @@ class LandingEnv(gym.Env):
         self._init_flight_log()
 
     def reset(self, *, seed: int | None = None, options: Dict[str, Any] | None = None) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Resets the environment by loading a quicksave to start in mid-air."""
         super().reset(seed=seed)
-
         if self.vessel:
             print(f"[EPISODE DONE] Steps={self.steps}, Reward={self.episode_reward:.2f}")
 
@@ -69,82 +62,85 @@ class LandingEnv(gym.Env):
                 raise RuntimeError("Could not connect to kRPC server.") from e
 
         self.sc = self.conn.space_center
-        
         print("Loading quicksave to begin landing sequence...")
         self.sc.load("quicksave")
         
-        time.sleep(2) # Allow time for the scene to load
+        time.sleep(2)
         self._wait_for_vessel()
         self._bind_vessel_and_streams()
         self.vessel.control.sas = True
 
         obs = self._get_obs()
+        # Initialize potential for first step
+        self.previous_potential = self._get_potential(obs)
         return obs, {}
 
+    def _get_potential(self, obs: np.ndarray) -> float:
+        """
+        Calculates a 'potential' value where 0 is the goal (landed) and 1 is the worst case.
+        This function is now NORMALIZED.
+        """
+        # Normalize each observation component to a 0-1 range
+        norm_alt = obs[0] / self.observation_space.high[0] # Altitude / 5000m
+        v_speed, h_speed = obs[1], obs[2]
+        # Normalize total speed to a 0-1 range
+        total_speed = np.sqrt(v_speed**2 + h_speed**2)
+        norm_speed = total_speed / self.MAX_SPEED_LIMIT # Speed / 200 m/s
+
+        # Potential is a weighted sum of normalized altitude and speed.
+        # This keeps the potential value in a small, stable range (approx. 0-2).
+        return (norm_alt * 1.0) + (norm_speed * 1.0)
+    
     def _reset_episode_state(self):
-        """Resets variables that track episode progress."""
         self.steps = 0
         self.episode_reward = 0.0
         self.start_time = time.time()
+        self.previous_potential = None
 
     def _wait_for_vessel(self, timeout: float = 30.0):
-        """Waits for the game to be in a controllable state after loading."""
         start = time.time()
         while time.time() - start < timeout:
             try:
                 if self.sc.active_vessel and self.sc.active_vessel.situation.name not in ['docked', 'escaping']:
                     return
             except krpc.error.RPCError:
-                pass # Ignore errors during scene transitions
+                pass
             time.sleep(0.5)
         raise TimeoutError("Timed out waiting for a controllable vessel.")
     
     def _bind_vessel_and_streams(self):
-        """Binds to the active vessel and creates kRPC data streams."""
         self.vessel = self.sc.active_vessel
-        
-        # Use the non-rotating reference frame of the celestial body for all flight data
         ref_frame = self.vessel.orbit.body.reference_frame
         flight = self.vessel.flight(ref_frame)
 
-        # --- Use modern, direct syntax for creating streams ---
         self.alt_s = self.conn.add_stream(getattr, flight, 'surface_altitude')
         self.vspeed_s = self.conn.add_stream(getattr, flight, 'vertical_speed')
         self.hspeed_s = self.conn.add_stream(getattr, flight, 'horizontal_speed')
-
-        # FIX: Get pitch from the correct flight object (surface-based, not orbital)
         self.pitch_s = self.conn.add_stream(getattr, flight, 'pitch')
         
-        # Fuel stream is already using the correct syntax
         self.fuel_max = max(1.0, self.vessel.resources.max("LiquidFuel"))
         self.fuel_s = self.conn.add_stream(self.vessel.resources.amount, "LiquidFuel")
-    
+
     def _get_obs(self) -> np.ndarray:
-        """Gets the current observation from the kRPC streams."""
         try:
             obs = np.array([
                 self.alt_s(), self.vspeed_s(), self.hspeed_s(), self.fuel_s() / self.fuel_max
             ], dtype=np.float32)
-        # FIX: Added ValueError to the list of exceptions to catch
         except (krpc.error.RPCError, krpc.error.StreamError, ValueError):
-            # If streams fail (e.g., vessel destroyed), return a zeroed observation
-            # The _check_termination method will then handle the end of the episode.
             obs = np.zeros(self.observation_space.shape, dtype=np.float32)
-            
         return np.clip(obs, self.observation_space.low, self.observation_space.high)
-    
+
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        """Advance the environment by one time step."""
         throttle = float(np.clip(action[0], 0, 1))
         try:
             self.vessel.control.throttle = throttle
         except krpc.error.RPCError:
-            return self._get_obs(), -self.PENALTY_CRASH_MULTIPLIER * 50, True, False, {}
+            return self._get_obs(), -200, True, False, {}
 
         time.sleep(self.step_sleep)
         obs = self._get_obs()
         
-        terminated = self._check_termination()
+        terminated = self._check_termination(obs)
         reward = self._compute_reward(obs, throttle, terminated)
         self.episode_reward += reward
         self._log_step(obs, throttle, reward)
@@ -155,98 +151,52 @@ class LandingEnv(gym.Env):
         return obs, reward, terminated, truncated, {}
 
     def _compute_reward(self, obs: np.ndarray, throttle: float, terminated: bool) -> float:
-            """
-            Calculates a dense reward for the current state to guide the agent.
-            """
-            # --- Unpack observations for clarity ---
-            altitude, v_speed, h_speed, _ = obs
-
-            # --- Terminal Rewards (End of Episode) ---
-            if terminated:
-                # (Your existing terminal reward logic is excellent and does not need to be changed)
-                try:
-                    final_pitch = self.pitch_s()
-                    situation = self.vessel.situation.name
-                    is_destroyed = self.vessel.parts.controlling is None
-                except krpc.error.RPCError:
-                    final_pitch, situation, is_destroyed = 0, "destroyed", True
-
-                if is_destroyed or situation not in ['landed', 'splashed', 'pre_launch']:
-                    return -200.0
-
+        """
+        Calculates reward based on landing performance and potential shaping.
+        """
+        # --- Terminal Rewards (End of Episode) ---
+        if terminated:
+            # Your existing terminal reward logic is great, so we'll reuse it.
+            try:
+                v_speed, h_speed = obs[1], obs[2]
+                final_pitch = self.pitch_s()
                 impact_speed = np.sqrt(v_speed**2 + h_speed**2)
                 angle_off_vertical = abs(final_pitch - 90.0)
                 is_upright = angle_off_vertical < self.MAX_LANDING_ANGLE
                 is_soft_impact = impact_speed < self.MAX_IMPACT_VELOCITY
+                
+                is_destroyed = self.vessel.parts.controlling is None
+                if is_destroyed:
+                    return -200.0 # Large penalty for destruction
 
                 if is_soft_impact and is_upright:
-                    reward = self.REWARD_SUCCESS
-                    reward += 50.0 * (1 - (impact_speed / self.MAX_IMPACT_VELOCITY))
-                    reward += 50.0 * (1 - (angle_off_vertical / self.MAX_LANDING_ANGLE))
-                    return reward
+                    return self.REWARD_SUCCESS # +200 for a perfect landing
                 else:
-                    return -100 - (impact_speed * 10)
+                    # Smaller penalty for a failed but non-destructive landing
+                    return -100.0 
+            except krpc.error.RPCError:
+                 return -200.0 # Vessel connection lost = crash
+        
+        # --- Potential-Based Shaping Reward (During Flight) ---
+        current_potential = self._get_potential(obs)
+        reward_shaping = self.previous_potential - current_potential
+        self.previous_potential = current_potential
 
-            # --- Shaping Rewards (During Flight) ---
-            else:
-                # 1. Heavily penalize moving upwards. This is the most direct fix.
-                upward_penalty = 0
-                if v_speed > 0:
-                    # The penalty increases exponentially the faster it goes up
-                    upward_penalty = - (v_speed ** 2) * 0.1 
+        # Add a small, constant penalty for using fuel/time to encourage efficiency
+        throttle_penalty = -throttle * 0.01
 
-                # 2. Stronger guidance to follow a safe descent profile.
-                safe_v_speed_target = -max(1.0, altitude / 15.0) # Slightly more aggressive descent
-                speed_error = abs(v_speed - safe_v_speed_target)
+        # The final reward is the shaping reward plus the small efficiency penalty.
+        # This will be a small number on each step, preventing reward explosion.
+        return reward_shaping + throttle_penalty
+    
+    def _check_termination(self, obs: np.ndarray) -> bool:
+        """More robust check for termination conditions."""
+        # NEW: Direct check for ground impact is the most reliable signal
+        if obs[0] <= 0.1: # obs[0] is altitude
+            return True
 
-                # Reward is higher when close to the target speed, but the penalty for being far is now larger.
-                speed_reward = 1.0 - min(speed_error / 50.0, 1.0) # Linear reward from 0 to 1
-
-                # 3. Penalize horizontal speed to encourage vertical descent
-                h_speed_penalty = -abs(h_speed) * 0.02
-
-                # 4. Standard penalties for fuel and time
-                fuel_penalty = self.PENALTY_FUEL_PER_THROTTLE * throttle
-                time_penalty = self.PENALTY_TIME
-
-                return upward_penalty + speed_reward + h_speed_penalty + fuel_penalty + time_penalty
-
-
-    def _init_flight_log(self):
-        """Creates the header for the flight log CSV file."""
-        with open(self.flight_log_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["step", "altitude_m", "v_speed", "h_speed", "throttle", "reward"])
-
-    def _log_step(self, obs: np.ndarray, throttle: float, reward: float):
-        """Logs a single step to the flight log file if logging is enabled."""
-        if self.logging_enabled:
-            with open(self.flight_log_file, "a", newline="") as f:
-                writer = csv.writer(f)
-                altitude, v_speed, h_speed, _ = obs
-                writer.writerow([self.steps, f"{altitude:.2f}", f"{v_speed:.2f}", f"{h_speed:.2f}", f"{throttle:.3f}", f"{reward:.4f}"])
-
-    def archive_log_file(self, archive_step_count: int):
-        """Renames the current flight log to an archive and starts a new one."""
-        if self.flight_log_file.exists() and self.flight_log_file.stat().st_size > 0:
-            archive_name = self.flight_log_file.with_name(
-                f"landing_flight_log_steps_{archive_step_count}.csv"
-            )
-            self.flight_log_file.replace(archive_name)
-            print(f"🗄️  Archived flight log to {archive_name}")
-            self._init_flight_log()
-
-    def enable_logging(self):
-        """Turns on logging for the next episode."""
-        self.logging_enabled = True
-
-    def disable_logging(self):
-        """Turns off logging."""
-        self.logging_enabled = False
-
-    def _check_termination(self) -> bool:
-        """Checks if the vessel has landed, crashed, or lost control."""
         try:
+            # Secondary checks for landed state or loss of control
             situation = self.vessel.situation
             if situation.name in ['landed', 'splashed', 'pre_launch']:
                 return True
@@ -254,22 +204,40 @@ class LandingEnv(gym.Env):
                 print("🛑 Control lost! Vessel likely destroyed.")
                 return True
         except krpc.error.RPCError:
+            # If we lose connection to the vessel, it's terminated
             return True
         return False
         
+    def _init_flight_log(self):
+        with open(self.flight_log_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "altitude_m", "v_speed", "h_speed", "throttle", "reward"])
+
+    def _log_step(self, obs: np.ndarray, throttle: float, reward: float):
+        if self.logging_enabled:
+            with open(self.flight_log_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                altitude, v_speed, h_speed, _ = obs
+                writer.writerow([self.steps, f"{altitude:.2f}", f"{v_speed:.2f}", f"{h_speed:.2f}", f"{throttle:.3f}", f"{reward:.4f}"])
+
+    def archive_log_file(self, archive_step_count: int):
+        if self.flight_log_file.exists() and self.flight_log_file.stat().st_size > 0:
+            archive_name = self.flight_log_file.with_name(f"landing_flight_log_steps_{archive_step_count}.csv")
+            self.flight_log_file.replace(archive_name)
+            print(f"🗄️  Archived flight log to {archive_name}")
+            self._init_flight_log()
+
+    def enable_logging(self):
+        self.logging_enabled = True
+
+    def disable_logging(self):
+        self.logging_enabled = False
+
     def render(self, mode: str = "human"):
-        """Prints the current state of the environment to the console."""
         obs = self._get_obs()
-        print(
-            f"Step: {self.steps:03d} | "
-            f"Alt: {obs[0]:6.1f}m | "
-            f"VSpd: {obs[1]:6.1f}m/s | "
-            f"HSpd: {obs[2]:6.1f}m/s | "
-            f"Fuel: {obs[3]:.2f}"
-        )
+        print(f"Step: {self.steps:03d} | Alt: {obs[0]:6.1f}m | VSpd: {obs[1]:6.1f}m/s | HSpd: {obs[2]:6.1f}m/s | Fuel: {obs[3]:.2f}")
 
     def close(self):
-        """Closes the kRPC connection."""
         if self.conn:
             print("Closing kRPC connection.")
             self.conn.close()
