@@ -24,6 +24,9 @@ KSP-RL-Agents/
 │
 ├── Helper/                    # Utility functions and plotting scripts
 │   └── plotting.py
+|   └── flight_recorder
+|       └── flight_recorder.py
+|       └── plot.py
 │
 ├── KSP_Hover_Agent/           # Hover agent training & testing
 │   ├── hover_agent.py         # PPO hover agent
@@ -93,14 +96,6 @@ Requirements include:
 ---
 
 ## 🎥 Demos
-
-* 🚀 **Launching** → Stable ascent
-  ![Launching Demo](showcase/earth_1.11.mp4)
-
-* 🛰 **Hovering** → Lock at \~200 m
-
-* 🔽 **Landing** → Soft powered touchdown on the moon
-  ![Landing Demo](showcase/moon_1.11.mp4)
 
 *(See `/showcase/` for full-resolution videos and captures)*
 
