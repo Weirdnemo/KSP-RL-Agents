@@ -24,6 +24,9 @@ KSP-RL-Agents/
 │
 ├── Helper/                    # Utility functions and plotting scripts
 │   └── plotting.py
+|   └── flight_recorder
+|       └── flight_recorder.py
+|       └── plot.py
 │
 ├── KSP_Hover_Agent/           # Hover agent training & testing
 │   ├── hover_agent.py         # PPO hover agent
