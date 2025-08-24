@@ -14,7 +14,8 @@ Hover/checkpoints
 Hover/training_logs
 Hover/logs
 
-__pycache__
+__pycache__/ksp_env.cpython-310.pyc
+__pycache__/ksp_hover_env.cpython-310.pyc
 
 KSP_Landing_Agent/landing_logs
 KSP_Landing_Agent/__pycache__/ksp_landing_env.cpython-310.pyc
