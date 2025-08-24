@@ -1,103 +1,135 @@
-    git clone https://github.com/your-username/ksp-hover-agent.git
-    cd ksp-hover-agent
-    ```
+# 🚀 KSP RL Agents
 
-2.  **Create a virtual environment (recommended):**
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows: `venv\Scripts\activate`
-    ```
-
-3.  **Install Python dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
+**Reinforcement Learning agents trained to launch, hover, and land rockets inside Kerbal Space Program (KSP).**
 
 ---
 
-## 🚀 How to Run
+## 🌌 Overview
 
-1.  **Start KSP:** Launch Kerbal Space Program.
-2.  **Load a vessel:** In KSP, load a rocket capable of vertical flight (e.g., a simple rocket with a single engine and fuel tank).
-3.  **Connect kRPC:** Ensure the kRPC server is running within KSP (usually starts automatically with the mod).
-4.  **Run the training script:**
-    ```bash
-    python train.py
-    ```
-    This will start the training process. The agent will interact with the rocket in KSP.
+This project explores **autonomous rocket control** in KSP using **Reinforcement Learning (RL)**.
+Agents are trained via [kRPC](https://krpc.github.io/krpc/) to interact with KSP in real-time, learning to:
 
-5.  **Run the evaluation script (after training):**
-    ```bash
-    python evaluate.py
-    # 🚀 KSP Hover Agent
+* 🔼 **Launch Agent** → perform smooth vertical ascents
+* 🛰 **Hover Agent** → stabilize around a target altitude
+* 🔽 **Landing Agent** → execute powered landings with minimal error
 
-This project trains a reinforcement learning (PPO) agent to control a rocket in Kerbal Space Program (KSP) using the kRPC API.  
-The agent learns to reach and hover around a target altitude of **200m** while minimizing overshoot and maintaining stability.
+All agents are built using **Stable-Baselines3 (PPO)**, with custom KSP environments exposing physics and telemetry.
 
 ---
 
-## 📹 Demo Video
-(youtube)
-
-<p align="center">
-  <a href="https://youtu.be/rWP7ViwXaMM" target="_blank">
-    <img src="/showcase/Frontface.png" alt="Watch the video" width="70%">
-  </a>
-</p>
-
----
-
-## 🖼 Screenshots
-
-### Untrained Rocket
-<p align="center">
-  <img src="/showcase/untrained.png" alt="Untrained Rocket" width="60%">
-</p>
-
-### Trained Rocket
-<p align="center">
-  <img src="/showcase/trained-16k.png" alt="Trained Rocket" width="60%">
-</p>
-
-    python evaluate.py
-    ```
-    This will run the trained agent in KSP and display its performance.
-
----
-
-## ⚙️ Project Structure
+## 📂 Repository Structure
 
 ```
-ksp-hover-agent/
-├── agents/                 # Contains the PPO agent implementation
-├── environments/           # Defines the KSP environment for training
-├── models/                 # Stores trained models
-├── showcase/               # Demo videos and screenshots
-│   ├── Frontface.png
-│   ├── untrained.png
-│   └── trained-16k.png
-├── utils/                  # Utility functions
-├── train.py                # Script to train the agent
-├── evaluate.py             # Script to evaluate the trained agent
-├── requirements.txt        # Python dependencies
-└── README.md               # This file
+KSP-RL-Agents/
+│
+├── Helper/                    # Utility functions and plotting scripts
+│   └── plotting.py
+│
+├── KSP_Hover_Agent/           # Hover agent training & testing
+│   ├── hover_agent.py         # PPO hover agent
+│   ├── hover_test.py          # Test scripts for hover agent
+│   └── ksp_hover_env.py       # Custom KSP hover environment
+│
+├── KSP_Landing_Agent/         # Landing agent training & testing
+│   ├── ksp_land_env.py        # Custom KSP landing environment
+│   ├── test_land_agent.py     # Evaluate trained landing agent
+│   └── train_land_agent.py    # Training loop for landing agent
+│
+├── KSP_Launching_Agent/       # Launching agent training & testing
+│   ├── agent.py               # PPO launch agent
+│   ├── ksp_env.py             # Custom KSP launch environment
+│   └── test.py                # Evaluate trained launch agent
+│
+├── showcase/                  # Demos and visualizations
+│   ├── earth_1.11.mp4         # Demo video: Launching agent
+│   ├── moon_1.11.mp4          # Demo video: Landing agent
+│   └── flight_dashboard.png
+│
+├── requirement.txt            # Python dependencies
+└── README.md                  # Project description (this file)
 ```
 
 ---
 
-## 🤝 Contributing
+## ⚙️ Installation
 
-Contributions are welcome! If you have suggestions for improvements or new features, please open an issue or submit a pull request.
+1. **Install KSP**
+
+   * Tested with KSP1
+
+2. **Install kRPC mod**
+
+   * Place in `GameData/`, start the server inside KSP
+
+3. **Set up Python environment**
+
+   ```bash
+   git clone https://github.com/Weirdnemo/KSP-RL-Agents.git
+   cd KSP-RL-Agents
+   pip install -r requirement.txt
+   ```
+
+Requirements include:
+
+* `stable-baselines3`
+* `gym`
+* `krpc`
+* `numpy`
 
 ---
 
-## 📄 License
+## 🧠 How It Works
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+* **Environment:** Custom Gym wrappers around KSP via kRPC (altitude, velocity, orientation, fuel states)
+* **Agent:** PPO learns throttle, pitch, and burn profiles
+* **Rewards:** Shaped to encourage stable control and minimize error
+
+| Agent     | Goal                                | Reward Signal          |
+| --------- | ----------------------------------- | ---------------------- |
+| Launching | Reach target altitude efficiently   | Time & fuel efficiency |
+| Hovering  | Hold altitude without overshoot     | Distance from setpoint |
+| Landing   | Touch down safely, minimal velocity | Smoothness + precision |
 
 ---
 
-## 🙏 Acknowledgements
+## 🎥 Demos
 
-*   [kRPC](https://krpc.github.io/krpc/) for providing the API to interact with KSP.
-*   [Stable Baselines3](https://stable-baselines3.readthedocs.io/en/master/) for the PPO implementation.
+* 🚀 **Launching** → Stable ascent
+  ![Launching Demo](showcase/earth_1.11.mp4)
+
+* 🛰 **Hovering** → Lock at \~200 m
+
+* 🔽 **Landing** → Soft powered touchdown on the moon
+  ![Landing Demo](showcase/moon_1.11.mp4)
+
+*(See `/showcase/` for full-resolution videos and captures)*
+
+---
+
+## 📊 Results
+
+* Trained over **tens of thousands of episodes**
+* Agents converge to **stable, repeatable behaviors** in all three tasks
+* Performance beats naive scripted control (PID-only baselines)
+
+---
+
+## 🔮 Next Steps
+
+* Multi-objective training: launch → hover → land in a single trajectory
+* More robust environments (randomized gravity, payloads, wind)
+* Compare PPO with SAC, TD3, A2C
+* Long-term: full **autonomous orbital insertion** in KSP
+
+---
+
+## 🏷 Credits
+
+* Built by [Weirdnemo](https://github.com/Weirdnemo) over 2–3 months
+* Powered by [Stable-Baselines3](https://github.com/DLR-RM/stable-baselines3) + [kRPC](https://krpc.github.io/krpc/)
+
+---
+
+## 📜 License
+
+Open source under your preferred license (default: MIT).
