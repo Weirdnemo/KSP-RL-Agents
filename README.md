@@ -26,16 +26,11 @@ KSP-RL-Agents/
 │   └── plotting.py
 │
 ├── KSP_Hover_Agent/           # Hover agent training & testing
-│   ├── checkpoints/           # Saved model checkpoints
-│   ├── logs/                  # Training logs
-│   ├── continue_hover_training.py
 │   ├── hover_agent.py         # PPO hover agent
 │   ├── hover_test.py          # Test scripts for hover agent
 │   └── ksp_hover_env.py       # Custom KSP hover environment
 │
 ├── KSP_Landing_Agent/         # Landing agent training & testing
-│   ├── landing_checkpoints/   # Saved model checkpoints
-│   ├── landing_logs/          # Training logs
 │   ├── ksp_land_env.py        # Custom KSP landing environment
 │   ├── test_land_agent.py     # Evaluate trained landing agent
 │   └── train_land_agent.py    # Training loop for landing agent
