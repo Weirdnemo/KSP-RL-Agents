@@ -120,7 +120,7 @@ Requirements include:
 
 ## 🏷 Credits
 
-* Built by [Weirdnemo](https://github.com/Weirdnemo) over 2–3 months
+* Built by [Weirdnemo](https://github.com/Weirdnemo) 
 * Powered by [Stable-Baselines3](https://github.com/DLR-RM/stable-baselines3) + [kRPC](https://krpc.github.io/krpc/)
 
 ---
